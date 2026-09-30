@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="SchoolHop">
+  <rect width="512" height="512" rx="96" fill="#050505"/>
+  <rect x="40" y="40" width="432" height="432" rx="72" fill="none" stroke="#2b2b26" stroke-width="16"/>
+  <path d="M112 296c0-73 59-132 132-132h24c73 0 132 59 132 132v40c0 14-11 25-25 25h-32a52 52 0 0 1-102 0h-30a52 52 0 0 1-102 0h-32c-14 0-25-11-25-25v-40Z" fill="#f7f7f2"/>
+  <path d="M164 278h184c-9-39-43-68-84-68h-16c-41 0-75 29-84 68Z" fill="#2fe082"/>
+  <circle cx="180" cy="361" r="25" fill="#050505"/>
+  <circle cx="332" cy="361" r="25" fill="#050505"/>
+  <path d="M186 126h140c12 0 22 10 22 22s-10 22-22 22H186c-12 0-22-10-22-22s10-22 22-22Z" fill="#f7f7f2"/>
+</svg>

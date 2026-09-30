@@ -1,0 +1,101 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.secret
+.envrc
+.envrc.*
+.npmrc
+.pypirc
+.netrc
+secrets/
+credentials/
+
+# Keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.cer
+*.crt
+*.jks
+*.jceks
+*.keystore
+*.sso
+.ssh/
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pub
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime and generated data
+uploads/
+backups/
+postgres_data/
+screenshots/
+reports/
+playwright-results/
+test-results/
+
+# Build output
+dist/
+build/
+www/
+
+# Logs and databases
+*.log
+*.log.*
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql
+!migrations/*.sql
+*.bak
+*.bak.*
+*.backup
+*.backup-*
+*.tar
+*.tar.gz
+*.tgz
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Native mobile generated files
+mobile/schoolhop-mobile/*
+!mobile/schoolhop-mobile/README.md
+!mobile/schoolhop-mobile/package.json
+mobile/schoolhop-mobile/ios/Pods/
+mobile/schoolhop-mobile/ios/build/
+mobile/schoolhop-mobile/android/.gradle/
+mobile/schoolhop-mobile/android/app/build/
+mobile/schoolhop-mobile/android/build/

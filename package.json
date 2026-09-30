@@ -1,0 +1,20 @@
+{
+  "name": "schoolhop-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SchoolHop browser PWA static frontend checks.",
+  "scripts": {
+    "lint": "eslint app/static/app.js app/static/service-worker.js tests/frontend/*.mjs",
+    "test": "node --test tests/frontend/*.test.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "eslint": "^9.36.0",
+    "globals": "^15.15.0",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

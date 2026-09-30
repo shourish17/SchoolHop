@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#050505" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="SchoolHop" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>SchoolHop</title>
+    <link rel="manifest" href="/static/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/static/icon.svg" />
+    <link rel="icon" href="/static/icon.svg" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">S</span>
+        <div>
+          <strong>SchoolHop</strong>
+          <span id="sessionSummary">Private school carpool</span>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="installApp" class="ghost hidden" type="button">Install</button>
+        <button id="logout" class="ghost hidden" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="auth" class="auth-layout">
+        <div class="intro">
+          <h1>School carpool days, made simple.</h1>
+          <p>One parent account, one active group, clear driver responses, and handover updates for the children in your carpool.</p>
+          <div class="notice">Create an account with email verification before joining or creating a group.</div>
+        </div>
+        <div class="auth-card">
+          <div class="segmented" role="tablist" aria-label="Authentication mode">
+            <button id="showLogin" class="active" type="button">Sign in</button>
+            <button id="showRegister" type="button">Create account</button>
+          </div>
+          <form id="loginForm" class="auth-form">
+            <input name="email" type="email" autocomplete="email" placeholder="Email" required />
+            <input name="password" type="password" autocomplete="current-password" placeholder="Password" required />
+            <button type="submit">Sign in</button>
+          </form>
+          <form id="registerStartForm" class="auth-form hidden">
+            <input name="name" autocomplete="name" placeholder="Parent name" required />
+            <input name="email" type="email" autocomplete="email" placeholder="Email" required />
+            <input name="phone" autocomplete="tel" placeholder="Phone" />
+            <button type="submit">Send verification code</button>
+          </form>
+          <form id="registerVerifyForm" class="auth-form hidden">
+            <p id="registerMessage">Enter the code from your email.</p>
+            <input name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Verification code" required />
+            <button type="submit">Verify email</button>
+            <button id="resendCode" class="ghost" type="button">Resend code</button>
+          </form>
+          <form id="registerCompleteForm" class="auth-form hidden">
+            <p>Email verified. Create your password.</p>
+            <input name="password" type="password" autocomplete="new-password" placeholder="Password, 8+ chars" required />
+            <button type="submit">Create account</button>
+          </form>
+        </div>
+      </section>
+
+      <section id="app" class="hidden">
+        <nav class="tabs" aria-label="SchoolHop sections">
+          <button data-tab="home" class="active" type="button">Home</button>
+          <button data-tab="trips" type="button">Trips</button>
+          <button data-tab="children" type="button">Children</button>
+          <button data-tab="more" type="button">More</button>
+        </nav>
+
+        <section id="home" class="tab active">
+          <div class="status-grid">
+            <article class="metric">
+              <span>Active group</span>
+              <strong id="homeGroup">None</strong>
+            </article>
+            <article class="metric">
+              <span>Upcoming trips</span>
+              <strong id="homeTrips">0</strong>
+            </article>
+            <article class="metric">
+              <span>Tracking</span>
+              <strong id="homeTracking">Off</strong>
+            </article>
+          </div>
+          <section class="panel">
+            <div class="section-head">
+              <h2>Next trips</h2>
+              <button id="refreshAll" class="ghost" type="button">Refresh</button>
+            </div>
+            <div id="homeTripList" class="card-list"></div>
+          </section>
+          <section class="panel">
+            <h2>Notifications</h2>
+            <div id="notificationList" class="card-list"></div>
+          </section>
+        </section>
+
+        <section id="trips" class="tab">
+          <form id="tripForm" class="panel">
+            <h2>Create trip</h2>
+            <div class="grid two compact">
+              <select name="driver_user_id" id="tripDriver" required></select>
+              <input name="service_date" type="date" required />
+              <select name="trip_type">
+                <option value="pickup">Pickup</option>
+                <option value="dropoff">Drop-off</option>
+              </select>
+              <input name="expected_time" type="time" required />
+            </div>
+            <fieldset id="tripChildren"></fieldset>
+            <button type="submit">Create trip</button>
+          </form>
+
+          <section class="panel trip-console">
+            <div class="section-head">
+              <h2>Current and future</h2>
+              <select id="activeTrip"></select>
+            </div>
+            <div id="trackingBanner" class="tracking off">Tracking off</div>
+            <div class="mini-actions">
+              <button id="acceptTrip" class="ghost" type="button">Accept</button>
+              <button id="declineTrip" class="ghost danger" type="button">Decline</button>
+              <button id="startTrip" type="button">Start trip</button>
+              <button id="sendLocation" class="ghost" type="button">Send GPS now</button>
+              <button id="endTrip" class="danger" type="button">End trip</button>
+            </div>
+            <div id="handoverButtons" class="handover"></div>
+            <div id="tripList" class="card-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="section-head">
+              <h2>History</h2>
+              <span id="freshness" class="pill muted">GPS unavailable</span>
+            </div>
+            <div id="historyTripList" class="card-list"></div>
+          </section>
+        </section>
+
+        <section id="children" class="tab">
+          <form id="childForm" class="panel">
+            <h2 id="childFormTitle">Add child</h2>
+            <input name="child_id" type="hidden" />
+            <select name="school_id" id="childSchoolSelect" required></select>
+            <input name="name" placeholder="Child name" required />
+            <input name="year_group" placeholder="Year group" required />
+            <input name="home_address" placeholder="Home street address for pickup/drop-off" />
+            <input name="home_city" placeholder="Home city" />
+            <input name="home_country" placeholder="Home country code" value="DE" maxlength="2" />
+            <textarea name="pickup_notes" placeholder="Pickup/drop-off notes"></textarea>
+            <input name="emergency_contact_name" placeholder="Emergency contact name" required />
+            <input name="emergency_contact_phone" placeholder="Emergency contact phone" required />
+            <div class="mini-actions">
+              <button type="submit">Save child</button>
+              <button id="cancelChildEdit" class="ghost hidden" type="button">Cancel edit</button>
+            </div>
+          </form>
+          <section class="panel">
+            <h2>Your children</h2>
+            <div id="childrenList" class="card-list"></div>
+          </section>
+        </section>
+
+        <section id="more" class="tab">
+          <div class="grid two">
+            <form id="schoolForm" class="panel">
+              <h2>Add school</h2>
+              <input name="name" placeholder="School name" required />
+              <input name="address" placeholder="Street address for routing" />
+              <input name="city" placeholder="City" />
+              <input name="country" maxlength="2" placeholder="Country code" value="DE" />
+              <button type="submit">Save school</button>
+            </form>
+            <form id="groupForm" class="panel">
+              <h2>Create group</h2>
+              <select name="school_id" id="schoolSelect" required></select>
+              <input name="name" placeholder="Group name" required />
+              <button type="submit">Create group</button>
+            </form>
+          </div>
+
+          <section class="panel">
+            <h2>Join group</h2>
+            <form id="acceptInviteForm" class="inline-form">
+              <input name="token" placeholder="Invitation token" required />
+              <button type="submit">Join</button>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="section-head">
+              <h2>Active group</h2>
+              <select id="groupSelect"></select>
+            </div>
+            <form id="inviteForm" class="inline-form">
+              <input name="email" type="email" placeholder="Parent email to invite" required />
+              <button type="submit">Invite</button>
+            </form>
+            <div class="mini-actions">
+              <button id="leaveGroup" class="ghost danger" type="button">Leave group</button>
+            </div>
+            <div id="groupDetail" class="detail-grid"></div>
+          </section>
+
+          <section class="panel">
+            <h2>Approve drivers</h2>
+            <form id="approvalForm">
+              <select name="child_id" id="approvalChild" required></select>
+              <select name="driver_user_id" id="approvalDriver" required></select>
+              <label class="check"><input type="checkbox" name="approved" checked /> Approved to drive this child</label>
+              <button type="submit">Save approval</button>
+            </form>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js?v=12"></script>
+  </body>
+</html>

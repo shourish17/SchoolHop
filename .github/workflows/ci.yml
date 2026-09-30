@@ -1,0 +1,60 @@
+name: SchoolHop CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: test
+      EXPOSE_DEVELOPMENT_VERIFICATION_CODES: "true"
+      EMAIL_PROVIDER: smtp
+      SMTP_HOST: ""
+      SMTP_FROM_EMAIL: ""
+      AGENTMAIL_API_KEY: ${{ secrets.AGENTMAIL_API_KEY }}
+      AGENTMAIL_FROM_EMAIL: ${{ secrets.AGENTMAIL_FROM_EMAIL }}
+      JWT_SECRET: test-only-ci-secret
+      DATABASE_URL: postgresql://schoolhop:schoolhop@localhost:5432/schoolhop
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run frontend typecheck
+        run: npm run typecheck
+
+      - name: Run frontend lint
+        run: npm run lint
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Run backend regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile backend modules
+        run: python -m py_compile app/main.py app/seed.py
+
+      - name: Validate Docker Compose config
+        run: docker compose config --quiet

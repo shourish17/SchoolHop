@@ -1,0 +1,72 @@
+name: schoolhop
+
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://schoolhop:schoolhop_dev_password@postgres:5432/schoolhop}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8088,http://127.0.0.1:8088,https://schoolhop.shourish.com}
+      RAW_LOCATION_RETENTION_MINUTES: ${RAW_LOCATION_RETENTION_MINUTES:-120}
+      LOCATION_STALE_SECONDS: ${LOCATION_STALE_SECONDS:-90}
+      SAFETY_TIMEOUT_MINUTES: ${SAFETY_TIMEOUT_MINUTES:-180}
+      FCM_SERVER_KEY: ${FCM_SERVER_KEY:-}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
+      APNS_PRIVATE_KEY: ${APNS_PRIVATE_KEY:-}
+      APNS_PRIVATE_KEY_PATH: ${APNS_PRIVATE_KEY_PATH:-}
+      APNS_USE_SANDBOX: ${APNS_USE_SANDBOX:-true}
+      PUBLIC_SITE_URL: ${PUBLIC_SITE_URL:-https://schoolhop.shourish.com}
+      GOOGLE_MAPS_BROWSER_KEY: ${GOOGLE_MAPS_BROWSER_KEY:-}
+      GOOGLE_ROUTES_API_KEY: ${GOOGLE_ROUTES_API_KEY:-}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      EXPOSE_DEVELOPMENT_VERIFICATION_CODES: ${EXPOSE_DEVELOPMENT_VERIFICATION_CODES:-false}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-smtp}
+      AGENTMAIL_API_KEY: ${AGENTMAIL_API_KEY:-}
+      AGENTMAIL_FROM_EMAIL: ${AGENTMAIL_FROM_EMAIL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+    ports:
+      - "127.0.0.1:${SCHOOLHOP_API_PORT:-8088}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+      - ai-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-schoolhop}
+      POSTGRES_USER: ${POSTGRES_USER:-schoolhop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-schoolhop_dev_password}
+    volumes:
+      - schoolhop_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  schoolhop_postgres_data:
+
+networks:
+  ai-net:
+    external: true

@@ -1,0 +1,16 @@
+{
+  "name": "schoolhop-native-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Archived native prototype. SchoolHop's maintained frontend is the root PWA package.",
+  "scripts": {
+    "lint": "echo 'Native prototype is archived; run npm run lint from the repository root for the PWA.'",
+    "test": "echo 'Native prototype is archived; run npm test from the repository root for the PWA.'",
+    "typecheck": "echo 'Native prototype is archived; run npm run typecheck from the repository root for the PWA.'"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "engines": {
+    "node": ">=20"
+  }
+}
