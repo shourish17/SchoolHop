@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   testflight:
-    runs-on: macos-15
+    runs-on: macos-26
     environment: testflight
     env:
       WORKSPACE_PATH: ios/App/App.xcworkspace
