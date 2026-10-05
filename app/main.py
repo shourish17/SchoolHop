@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
+import logging
 import secrets
 import smtplib
 import time as time_module
@@ -18,7 +18,7 @@ from urllib.parse import quote
 import asyncpg
 import httpx
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_from_email: str | None = None
     smtp_use_tls: bool = True
+    slow_request_ms: int = 250
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -66,6 +67,7 @@ class Settings(BaseSettings):
 settings = Settings()
 passwords = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 pool: asyncpg.Pool | None = None
+logger = logging.getLogger("schoolhop")
 
 
 def row_to_dict(row: asyncpg.Record | None) -> dict[str, Any] | None:
@@ -125,6 +127,17 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
+@app.middleware("http")
+async def add_timing_headers(request: Request, call_next):
+    started = time_module.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time_module.perf_counter() - started) * 1000
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    if request.url.path.startswith("/api/") and elapsed_ms >= settings.slow_request_ms:
+        logger.info("slow_request path=%s method=%s duration_ms=%.1f", request.url.path, request.method, elapsed_ms)
+    return response
+
+
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=200)
@@ -154,6 +167,15 @@ class LoginIn(BaseModel):
     password: str
 
 
+class PasswordResetStartIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetCompleteIn(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+    password: str = Field(min_length=8, max_length=200)
+
+
 class SchoolIn(BaseModel):
     name: str = Field(min_length=2, max_length=180)
     address: str | None = Field(default=None, max_length=240)
@@ -168,6 +190,16 @@ class GroupIn(BaseModel):
 
 class InviteIn(BaseModel):
     email: EmailStr
+
+
+class JoinRequestIn(BaseModel):
+    group_id: UUID
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class JoinRequestDecisionIn(BaseModel):
+    status: str = Field(pattern="^(approved|declined)$")
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class GroupMemberIn(BaseModel):
@@ -211,6 +243,11 @@ class ChangeRequestIn(BaseModel):
     request_type: str = Field(pattern="^(swap|change|absence)$")
     proposed_driver_user_id: UUID | None = None
     note: str = Field(min_length=1, max_length=1000)
+
+
+class ChangeRequestDecisionIn(BaseModel):
+    status: str = Field(pattern="^(accepted|declined)$")
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class TripNoteIn(BaseModel):
@@ -270,6 +307,11 @@ def verification_hash(email: str, code: str, purpose: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def reset_token_hash(token: str) -> str:
+    payload = f"password_reset:{token}:{settings.jwt_secret}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def mask_email(email: str) -> str:
     local, _, domain = email.partition("@")
     if not domain:
@@ -284,8 +326,10 @@ def can_expose_development_codes() -> bool:
 
 async def send_email(to: str, subject: str, text: str, html: str | None = None) -> str:
     provider = (settings.email_provider or "smtp").strip().lower()
+    masked_to = mask_email(to)
     if provider == "agentmail":
         if not settings.agentmail_api_key or not settings.agentmail_from_email:
+            logger.warning("Email delivery not configured for provider=agentmail recipient=%s subject=%s", masked_to, subject)
             return "not_configured"
         inbox_id = quote(settings.agentmail_from_email, safe="")
         payload = {"to": to, "subject": subject, "text": text}
@@ -299,12 +343,21 @@ async def send_email(to: str, subject: str, text: str, html: str | None = None) 
                     json=payload,
                 )
             if response.status_code >= 400:
+                logger.warning(
+                    "Email delivery failed provider=agentmail recipient=%s subject=%s status_code=%s response=%s",
+                    masked_to,
+                    subject,
+                    response.status_code,
+                    response.text[:500],
+                )
                 return "failed"
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            logger.warning("Email delivery error provider=agentmail recipient=%s subject=%s error=%s", masked_to, subject, exc)
             return "failed"
         return "sent"
 
     if not settings.smtp_host or not settings.smtp_from_email:
+        logger.warning("Email delivery not configured for provider=smtp recipient=%s subject=%s", masked_to, subject)
         return "not_configured"
     message = EmailMessage()
     message["Subject"] = subject
@@ -320,7 +373,8 @@ async def send_email(to: str, subject: str, text: str, html: str | None = None) 
             if settings.smtp_username and settings.smtp_password:
                 smtp.login(settings.smtp_username, settings.smtp_password)
             smtp.send_message(message)
-    except OSError:
+    except OSError as exc:
+        logger.warning("Email delivery error provider=smtp recipient=%s subject=%s error=%s", masked_to, subject, exc)
         return "failed"
     return "sent"
 
@@ -432,7 +486,16 @@ async def send_push_to_device(device: asyncpg.Record, title: str, body: str, dat
         response.raise_for_status()
 
 
-async def deliver_push(database: asyncpg.Pool, user_id: UUID | str, kind: str, title: str, body: str, entity_type: str | None, entity_id: UUID | str | None) -> None:
+async def deliver_push(
+    database: asyncpg.Pool,
+    user_id: UUID | str,
+    kind: str,
+    title: str,
+    body: str,
+    entity_type: str | None,
+    entity_id: UUID | str | None,
+    action_url: str | None = None,
+) -> None:
     devices = await database.fetch(
         "SELECT * FROM mobile_devices WHERE user_id = $1 AND enabled = true",
         UUID(str(user_id)),
@@ -441,6 +504,7 @@ async def deliver_push(database: asyncpg.Pool, user_id: UUID | str, kind: str, t
         "kind": kind,
         "entity_type": entity_type or "",
         "entity_id": str(entity_id) if entity_id else "",
+        "action_url": action_url or "",
     }
     for device in devices:
         try:
@@ -463,11 +527,12 @@ async def notify(
     *,
     email: bool = False,
     idempotency_key: str | None = None,
+    action_url: str | None = None,
 ) -> None:
     row = await database.fetchrow(
         """
-        INSERT INTO notifications (user_id, kind, title, body, entity_type, entity_id, idempotency_key)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO notifications (user_id, kind, title, body, entity_type, entity_id, idempotency_key, action_url)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL
         DO NOTHING
         RETURNING id
@@ -479,14 +544,11 @@ async def notify(
         entity_type,
         UUID(str(entity_id)) if entity_id else None,
         idempotency_key,
+        action_url,
     )
     if idempotency_key and not row:
         return
-    await deliver_push(database, user_id, kind, title, body, entity_type, entity_id)
-    if email:
-        recipient = await database.fetchrow("SELECT email FROM users WHERE id = $1 AND status = 'active'", UUID(str(user_id)))
-        if recipient:
-            await send_email(recipient["email"], title, body)
+    await deliver_push(database, user_id, kind, title, body, entity_type, entity_id, action_url)
 
 
 async def active_group_id(database: asyncpg.Pool, user_id: UUID | str) -> UUID | None:
@@ -547,6 +609,20 @@ async def trip_with_permission(database: asyncpg.Pool, user_id: UUID | str, trip
     creator = await database.fetchval("SELECT created_by FROM carpool_groups WHERE id = $1", trip["group_id"])
     if creator == UUID(str(user_id)):
         return trip
+    proposed_swap = await database.fetchval(
+        """
+        SELECT 1
+        FROM roster_change_requests
+        WHERE trip_id = $1
+          AND proposed_driver_user_id = $2
+          AND request_type = 'swap'
+        LIMIT 1
+        """,
+        UUID(str(trip_id)),
+        UUID(str(user_id)),
+    )
+    if proposed_swap:
+        return trip
     raise HTTPException(status_code=403, detail="Trip-specific permission required")
 
 
@@ -555,6 +631,32 @@ async def require_trip_driver(database: asyncpg.Pool, user_id: UUID | str, trip_
     if trip["driver_user_id"] != UUID(str(user_id)):
         raise HTTPException(status_code=403, detail="Assigned driver required")
     return trip
+
+
+def trip_label(trip: asyncpg.Record | dict[str, Any]) -> str:
+    return f"{trip['service_date']} {trip['expected_time']} {trip['trip_type']}"
+
+
+async def trip_child_parent_rows(database: asyncpg.Pool, trip_id: UUID | str) -> list[asyncpg.Record]:
+    return await database.fetch(
+        """
+        SELECT DISTINCT c.parent_id, c.name AS child_name
+        FROM trip_children tc
+        JOIN children c ON c.id = tc.child_id
+        WHERE tc.trip_id = $1
+        ORDER BY child_name
+        """,
+        UUID(str(trip_id)),
+    )
+
+
+async def affected_trip_user_ids(database: asyncpg.Pool, trip: asyncpg.Record | dict[str, Any], *, include_driver: bool = True, include_creator: bool = True) -> set[UUID]:
+    user_ids = {row["parent_id"] for row in await trip_child_parent_rows(database, trip["id"])}
+    if include_driver:
+        user_ids.add(trip["driver_user_id"])
+    if include_creator:
+        user_ids.add(trip["created_by"])
+    return {UUID(str(user_id)) for user_id in user_ids if user_id}
 
 
 async def enforce_trip_child_access(database: asyncpg.Pool, user_id: UUID | str, trip_id: UUID | str, child_id: UUID | str) -> None:
@@ -579,7 +681,19 @@ async def enforce_trip_child_access(database: asyncpg.Pool, user_id: UUID | str,
 async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> list[dict[str, Any]]:
     is_driver = trip["driver_user_id"] == UUID(str(user_id))
     creator = await database.fetchval("SELECT created_by FROM carpool_groups WHERE id = $1", trip["group_id"])
-    can_view_all = is_driver or creator == UUID(str(user_id))
+    proposed_swap = await database.fetchval(
+        """
+        SELECT 1
+        FROM roster_change_requests
+        WHERE trip_id = $1
+          AND proposed_driver_user_id = $2
+          AND request_type = 'swap'
+        LIMIT 1
+        """,
+        trip["id"],
+        UUID(str(user_id)),
+    )
+    can_view_all = is_driver or creator == UUID(str(user_id)) or bool(proposed_swap)
     if can_view_all:
         rows = await database.fetch(
             """
@@ -647,7 +761,19 @@ def route_waypoint_from_child(child: asyncpg.Record) -> dict[str, Any] | None:
 async def trip_route_children_for_user(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> tuple[list[asyncpg.Record], bool]:
     is_driver = trip["driver_user_id"] == UUID(str(user_id))
     creator = await database.fetchval("SELECT created_by FROM carpool_groups WHERE id = $1", trip["group_id"])
-    can_view_all_stops = is_driver or creator == UUID(str(user_id))
+    proposed_swap = await database.fetchval(
+        """
+        SELECT 1
+        FROM roster_change_requests
+        WHERE trip_id = $1
+          AND proposed_driver_user_id = $2
+          AND request_type = 'swap'
+        LIMIT 1
+        """,
+        trip["id"],
+        UUID(str(user_id)),
+    )
+    can_view_all_stops = is_driver or creator == UUID(str(user_id)) or bool(proposed_swap)
     if can_view_all_stops:
         rows = await database.fetch(
             """
@@ -703,6 +829,101 @@ async def serialize_trip(database: asyncpg.Pool, user_id: UUID | str, trip: asyn
     return payload
 
 
+async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: list[asyncpg.Record]) -> list[dict[str, Any]]:
+    if not trips:
+        return []
+
+    user_uuid = UUID(str(user_id))
+    trip_ids = [trip["id"] for trip in trips]
+    group_ids = list({trip["group_id"] for trip in trips})
+    driver_ids = list({trip["driver_user_id"] for trip in trips})
+    now = datetime.now(UTC)
+
+    driver_rows, group_creator_rows, swap_rows, child_rows, response_rows, location_rows = await asyncio.gather(
+        database.fetch("SELECT id, name, email, phone FROM users WHERE id = ANY($1::uuid[])", driver_ids),
+        database.fetch("SELECT id, created_by FROM carpool_groups WHERE id = ANY($1::uuid[])", group_ids),
+        database.fetch(
+            """
+            SELECT trip_id
+            FROM roster_change_requests
+            WHERE trip_id = ANY($1::uuid[])
+              AND proposed_driver_user_id = $2
+              AND request_type = 'swap'
+            """,
+            trip_ids,
+            user_uuid,
+        ),
+        database.fetch(
+            """
+            SELECT tc.*, c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
+                   c.parent_id, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
+            FROM trip_children tc
+            JOIN children c ON c.id = tc.child_id
+            WHERE tc.trip_id = ANY($1::uuid[])
+            ORDER BY c.name
+            """,
+            trip_ids,
+        ),
+        database.fetch(
+            "SELECT trip_id, status, note, created_at FROM trip_responses WHERE trip_id = ANY($1::uuid[]) AND user_id = $2",
+            trip_ids,
+            user_uuid,
+        ),
+        database.fetch(
+            """
+            SELECT DISTINCT ON (trip_id) *
+            FROM trip_locations
+            WHERE trip_id = ANY($1::uuid[])
+            ORDER BY trip_id, received_at DESC
+            """,
+            trip_ids,
+        ),
+    )
+
+    drivers = {row["id"]: row_to_dict(row) for row in driver_rows}
+    group_creators = {row["id"]: row["created_by"] for row in group_creator_rows}
+    proposed_swap_trip_ids = {row["trip_id"] for row in swap_rows}
+    responses = {row["trip_id"]: row_to_dict(row) for row in response_rows}
+    locations: dict[UUID, dict[str, Any] | None] = {}
+    for row in location_rows:
+        location = row_to_dict(row) or {}
+        age = (now - row["received_at"]).total_seconds()
+        location["age_seconds"] = int(age)
+        location["fresh"] = age <= settings.location_stale_seconds
+        locations[row["trip_id"]] = location
+
+    children_by_trip: dict[UUID, list[dict[str, Any]]] = {}
+    for row in child_rows:
+        child = row_to_dict(row) or {}
+        children_by_trip.setdefault(row["trip_id"], []).append(child)
+
+    payloads: list[dict[str, Any]] = []
+    for trip in trips:
+        is_driver = trip["driver_user_id"] == user_uuid
+        can_view_all = is_driver or group_creators.get(trip["group_id"]) == user_uuid or trip["id"] in proposed_swap_trip_ids
+        children: list[dict[str, Any]] = []
+        for child in children_by_trip.get(trip["id"], []):
+            if not can_view_all and child.get("parent_id") != str(user_uuid):
+                continue
+            child_payload = dict(child)
+            if not is_driver and child_payload.get("parent_id") != str(user_uuid):
+                child_payload["home_address"] = None
+                child_payload["home_city"] = None
+                child_payload["home_country"] = None
+                child_payload["home_latitude"] = None
+                child_payload["home_longitude"] = None
+                child_payload["home_place_id"] = None
+            children.append(child_payload)
+
+        payload = row_to_dict(trip) or {}
+        payload["driver"] = drivers.get(trip["driver_user_id"])
+        payload["children"] = children
+        payload["my_response"] = responses.get(trip["id"])
+        payload["latest_location"] = locations.get(trip["id"])
+        payloads.append(payload)
+    return payloads
+
+
 @app.get("/", include_in_schema=False)
 async def web_app() -> FileResponse:
     return FileResponse("app/static/index.html")
@@ -724,6 +945,99 @@ async def web_config() -> dict[str, Any]:
         "location_stale_seconds": settings.location_stale_seconds,
         "safety_timeout_minutes": settings.safety_timeout_minutes,
     }
+
+
+@app.get("/api/pending-actions")
+async def list_pending_actions(user: UserDep, database: DbDep) -> list[dict[str, Any]]:
+    user_id = UUID(user["id"])
+    invitation_rows = await database.fetch(
+        """
+        SELECT id, token, email, expires_at, created_at
+        FROM invitations
+        WHERE email = lower($1)
+          AND status = 'pending'
+          AND expires_at > now()
+        ORDER BY created_at DESC
+        """,
+        user["email"],
+    )
+    assignment_rows = await database.fetch(
+        """
+        SELECT t.*, driver.name AS driver_name
+        FROM trips t
+        JOIN users driver ON driver.id = t.driver_user_id
+        JOIN group_members gm
+          ON gm.group_id = t.group_id
+         AND gm.user_id = $1
+         AND gm.status = 'active'
+        LEFT JOIN trip_responses tr
+          ON tr.trip_id = t.id
+         AND tr.user_id = $1
+        WHERE t.driver_user_id = $1
+          AND t.status IN ('planned', 'delayed')
+          AND t.service_date >= CURRENT_DATE
+          AND tr.id IS NULL
+        ORDER BY t.service_date, t.expected_time
+        """,
+        user_id,
+    )
+    swap_rows = await database.fetch(
+        """
+        SELECT rcr.*, t.service_date, t.trip_type, t.expected_time, requester.name AS requester_name
+        FROM roster_change_requests rcr
+        JOIN trips t ON t.id = rcr.trip_id
+        JOIN users requester ON requester.id = rcr.requested_by
+        JOIN group_members gm
+          ON gm.group_id = t.group_id
+         AND gm.user_id = $1
+         AND gm.status = 'active'
+        WHERE rcr.request_type = 'swap'
+          AND rcr.status = 'open'
+          AND rcr.proposed_driver_user_id = $1
+          AND t.status IN ('planned', 'delayed')
+          AND t.service_date >= CURRENT_DATE
+        ORDER BY t.service_date, t.expected_time
+        """,
+        user_id,
+    )
+
+    actions: list[dict[str, Any]] = []
+    for invitation in invitation_rows:
+        actions.append(
+            {
+                "type": "invitation",
+                "id": str(invitation["id"]),
+                "title": "SchoolHop invitation",
+                "body": "Accept or decline this carpool group invitation.",
+                "action_url": f"/?invite={invitation['token']}",
+                "created_at": serialize_value(invitation["created_at"]),
+            }
+        )
+    for trip in assignment_rows:
+        actions.append(
+            {
+                "type": "driver_assignment",
+                "id": str(trip["id"]),
+                "trip_id": str(trip["id"]),
+                "title": "Driver assignment",
+                "body": f"Accept or decline {trip_label(trip)}.",
+                "action_url": f"/?tab=trip&trip={trip['id']}",
+                "created_at": serialize_value(trip["created_at"]),
+            }
+        )
+    for request in swap_rows:
+        actions.append(
+            {
+                "type": "swap_request",
+                "id": str(request["id"]),
+                "trip_id": str(request["trip_id"]),
+                "title": "Trip swap request received",
+                "body": f"{request['requester_name']} asked you to cover {trip_label(request)}.",
+                "action_url": f"/?tab=trip&trip={request['trip_id']}&swap_request={request['id']}",
+                "created_at": serialize_value(request["created_at"]),
+            }
+        )
+    return actions
 
 
 @app.post("/api/client-errors")
@@ -912,6 +1226,72 @@ async def login(payload: LoginIn, database: DbDep) -> dict[str, Any]:
     return {"token": create_token(user["id"]), "user": row_to_dict(user)}
 
 
+@app.post("/api/auth/password-reset/start")
+async def password_reset_start(payload: PasswordResetStartIn, database: DbDep) -> dict[str, Any]:
+    generic_message = "If an account exists for this email, a password reset link has been sent."
+    email = normalize_email(payload.email)
+    user = await database.fetchrow("SELECT id, email FROM users WHERE email = $1 AND status = 'active'", email)
+    reset_token: str | None = None
+    delivery_status: str | None = None
+    if user:
+        reset_token = secrets.token_urlsafe(32)
+        async with database.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
+                    user["id"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+                    VALUES ($1, $2, now() + interval '30 minutes')
+                    """,
+                    user["id"],
+                    reset_token_hash(reset_token),
+                )
+        reset_url = f"{settings.public_site_url.rstrip('/')}/?reset={reset_token}"
+        delivery_status = await send_email(
+            user["email"],
+            "Reset your SchoolHop password",
+            f"Open this secure link to reset your SchoolHop password: {reset_url}\n\nThis link expires in 30 minutes and can be used once.",
+        )
+    response: dict[str, Any] = {"status": "ok", "message": generic_message}
+    if can_expose_development_codes() and reset_token:
+        response["reset_token"] = reset_token
+        response["reset_url"] = f"{settings.public_site_url.rstrip('/')}/?reset={reset_token}"
+        response["delivery_status"] = delivery_status
+    return response
+
+
+@app.post("/api/auth/password-reset/complete")
+async def password_reset_complete(payload: PasswordResetCompleteIn, database: DbDep) -> dict[str, str]:
+    token_hash = reset_token_hash(payload.token)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            reset = await conn.fetchrow(
+                """
+                SELECT prt.*, u.id AS account_user_id
+                FROM password_reset_tokens prt
+                JOIN users u ON u.id = prt.user_id AND u.status = 'active'
+                WHERE prt.token_hash = $1 AND prt.used_at IS NULL AND prt.expires_at > now()
+                FOR UPDATE OF prt
+                """,
+                token_hash,
+            )
+            if not reset:
+                raise HTTPException(status_code=400, detail="Password reset link is invalid or expired")
+            await conn.execute("UPDATE users SET password_hash = $2 WHERE id = $1", reset["account_user_id"], passwords.hash(payload.password))
+            await conn.execute("UPDATE password_reset_tokens SET used_at = now() WHERE id = $1", reset["id"])
+            await conn.execute(
+                """
+                INSERT INTO audit_records (actor_user_id, action, details)
+                VALUES ($1, 'user.password_reset', '{}'::jsonb)
+                """,
+                reset["account_user_id"],
+            )
+    return {"status": "ok", "message": "Your password has been reset. You can sign in now."}
+
+
 @app.get("/api/me")
 async def me(user: UserDep) -> dict[str, Any]:
     return {"user": {k: v for k, v in user.items() if k != "password_hash"}}
@@ -983,6 +1363,21 @@ async def list_groups(user: UserDep, database: DbDep) -> list[dict[str, Any]]:
     return rows_to_list(rows)
 
 
+@app.get("/api/groups/discover")
+async def discover_groups(user: UserDep, database: DbDep) -> list[dict[str, Any]]:
+    rows = await database.fetch(
+        """
+        SELECT cg.id, cg.name, cg.created_at,
+               s.id AS school_id, s.name AS school_name, s.city AS school_city
+        FROM carpool_groups cg
+        JOIN schools s ON s.id = cg.school_id
+        ORDER BY s.name, s.city, cg.name
+        LIMIT 200
+        """
+    )
+    return rows_to_list(rows)
+
+
 @app.post("/api/groups")
 async def create_group(payload: GroupIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     await require_no_active_group(database, user["id"])
@@ -1028,10 +1423,127 @@ async def group_detail(group_id: UUID, user: UserDep, database: DbDep) -> dict[s
         group_id,
     )
     invitations = await database.fetch(
-        "SELECT id, email, status, expires_at, created_at FROM invitations WHERE group_id = $1 ORDER BY created_at DESC",
+        "SELECT id, email, token, status, expires_at, created_at FROM invitations WHERE group_id = $1 ORDER BY created_at DESC",
         group_id,
     )
-    return {"group": row_to_dict(group), "members": rows_to_list(members), "invitations": rows_to_list(invitations)}
+    join_requests: list[asyncpg.Record] = []
+    if group["created_by"] == UUID(user["id"]):
+        join_requests = await database.fetch(
+            """
+            SELECT gjr.*, u.name AS requester_name, u.email AS requester_email
+            FROM group_join_requests gjr
+            JOIN users u ON u.id = gjr.requester_user_id
+            WHERE gjr.group_id = $1 AND gjr.status = 'pending'
+            ORDER BY gjr.created_at DESC
+            """,
+            group_id,
+        )
+    return {"group": row_to_dict(group), "members": rows_to_list(members), "invitations": rows_to_list(invitations), "join_requests": rows_to_list(join_requests)}
+
+
+@app.post("/api/groups/access-requests")
+async def request_group_access(payload: JoinRequestIn, user: UserDep, database: DbDep) -> dict[str, Any]:
+    await require_no_active_group(database, user["id"])
+    group = await database.fetchrow(
+        """
+        SELECT cg.*, s.name AS school_name, s.city AS school_city
+        FROM carpool_groups cg
+        JOIN schools s ON s.id = cg.school_id
+        WHERE cg.id = $1
+        """,
+        payload.group_id,
+    )
+    if not group:
+        raise HTTPException(status_code=404, detail="SchoolHop group not found")
+    row = await database.fetchrow(
+        """
+        INSERT INTO group_join_requests (group_id, requester_user_id, requester_note, status, updated_at)
+        VALUES ($1, $2, $3, 'pending', now())
+        ON CONFLICT (group_id, requester_user_id)
+        DO UPDATE SET requester_note = EXCLUDED.requester_note,
+                      status = 'pending',
+                      decided_by = NULL,
+                      decided_at = NULL,
+                      updated_at = now()
+        RETURNING *
+        """,
+        payload.group_id,
+        UUID(user["id"]),
+        payload.note,
+    )
+    await notify(
+        database,
+        group["created_by"],
+        "group_access_request",
+        "SchoolHop access request",
+        f"{user['name']} ({user['email']}) requested access to {group['name']} at {group['school_name']}.",
+        "group",
+        group["id"],
+        email=True,
+        idempotency_key=f"group_access_request:{row['id']}:{group['created_by']}",
+        action_url="/?tab=group",
+    )
+    await audit(database, user["id"], "group.access_requested", group["id"], details={"request_id": str(row["id"])})
+    return row_to_dict(row) or {}
+
+
+@app.post("/api/groups/{group_id}/access-requests/{request_id}/decision")
+async def decide_group_access_request(group_id: UUID, request_id: UUID, payload: JoinRequestDecisionIn, user: UserDep, database: DbDep) -> dict[str, Any]:
+    await require_group_creator(database, user["id"], group_id)
+    request = await database.fetchrow(
+        """
+        SELECT gjr.*, u.name AS requester_name, u.email AS requester_email
+        FROM group_join_requests gjr
+        JOIN users u ON u.id = gjr.requester_user_id
+        WHERE gjr.id = $1 AND gjr.group_id = $2
+        """,
+        request_id,
+        group_id,
+    )
+    if not request:
+        raise HTTPException(status_code=404, detail="Access request not found")
+    if request["status"] != "pending":
+        raise HTTPException(status_code=409, detail="Access request already decided")
+    if payload.status == "approved":
+        await require_no_active_group(database, request["requester_user_id"], group_id)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            if payload.status == "approved":
+                await conn.execute(
+                    """
+                    INSERT INTO group_members (group_id, user_id, role, status)
+                    VALUES ($1, $2, 'member', 'active')
+                    ON CONFLICT (group_id, user_id) DO UPDATE SET status = 'active'
+                    """,
+                    group_id,
+                    request["requester_user_id"],
+                )
+            row = await conn.fetchrow(
+                """
+                UPDATE group_join_requests
+                SET status = $3, decided_by = $4, decided_at = now(), updated_at = now()
+                WHERE id = $1 AND group_id = $2
+                RETURNING *
+                """,
+                request_id,
+                group_id,
+                payload.status,
+                UUID(user["id"]),
+            )
+    await notify(
+        database,
+        request["requester_user_id"],
+        "group_access_decision",
+        f"SchoolHop access {payload.status}",
+        payload.note or f"Your request to join the SchoolHop group was {payload.status}.",
+        "group",
+        group_id,
+        email=True,
+        idempotency_key=f"group_access_decision:{request_id}:{payload.status}:{request['requester_user_id']}",
+        action_url="/?tab=group",
+    )
+    await audit(database, user["id"], "group.access_decided", group_id, details={"request_id": str(request_id), "status": payload.status})
+    return row_to_dict(row) or {}
 
 
 @app.post("/api/groups/{group_id}/invitations")
@@ -1050,18 +1562,24 @@ async def invite_parent(group_id: UUID, payload: InviteIn, user: UserDep, databa
         UUID(user["id"]),
     )
     invited_user = await database.fetchrow("SELECT id FROM users WHERE email = lower($1)", payload.email)
-    if invited_user:
-        await notify(database, invited_user["id"], "invitation", "SchoolHop group invitation", "You have been invited to a private carpool group.", "group", group_id)
     invite_url = f"{settings.public_site_url.rstrip('/')}/?invite={token}"
-    delivery_status = await send_email(
-        normalize_email(payload.email),
-        "SchoolHop group invitation",
-        f"{user['name']} invited you to join a SchoolHop carpool group. Open {invite_url} or enter this invitation token in SchoolHop: {token}. This invite expires in 14 days.",
-    )
+    if invited_user:
+        await notify(
+            database,
+            invited_user["id"],
+            "invitation",
+            f"{user['name']} invited you to join SchoolHop",
+            f"{user['name']} invited you to join a SchoolHop carpool group.",
+            "invitation",
+            invitation["id"],
+            email=False,
+            idempotency_key=f"group_invitation:{invitation['id']}:{invited_user['id']}",
+            action_url=f"/?invite={token}",
+        )
     await audit(database, user["id"], "group.invitation_created", group_id, details={"email": payload.email})
     payload_out = row_to_dict(invitation) or {}
-    payload_out["delivery_status"] = delivery_status
-    payload_out["invite_url"] = invite_url if delivery_status != "sent" else None
+    payload_out["delivery_status"] = "not_sent_activity_email_disabled"
+    payload_out["invite_url"] = invite_url
     return payload_out
 
 
@@ -1131,7 +1649,7 @@ async def remove_group_member(group_id: UUID, member_user_id: UUID, user: UserDe
     )
     if not row:
         raise HTTPException(status_code=404, detail="Active group member not found")
-    await notify(database, member_user_id, "group_removed", "Removed from SchoolHop group", "You were removed from a SchoolHop carpool group.", "group", group_id, email=True)
+    await notify(database, member_user_id, "group_removed", "Removed from SchoolHop group", "You were removed from a SchoolHop carpool group.", "group", group_id, email=True, action_url="/?tab=group")
     await audit(database, user["id"], "group.member_removed", group_id, details={"member_user_id": str(member_user_id)})
     return {"status": "ok"}
 
@@ -1365,9 +1883,22 @@ async def create_trip(group_id: UUID, payload: TripIn, user: UserDep, database: 
                 trip["id"],
                 email=True,
                 idempotency_key=f"driver_assignment:{trip['id']}:{participant_id}",
+                action_url=f"/?tab=trip&trip={trip['id']}",
             )
         else:
-            await notify(database, participant_id, "roster", "Roster updated", "A carpool trip was added or changed.", "trip", trip["id"])
+            child_names = ", ".join(child["name"] for child in child_rows if child["parent_id"] == participant_id)
+            await notify(
+                database,
+                participant_id,
+                "roster",
+                "SchoolHop trip assigned",
+                f"{child_names or 'Your child'} has a {trip_label(trip)} trip with an assigned driver.",
+                "trip",
+                trip["id"],
+                email=True,
+                idempotency_key=f"parent_assignment:{trip['id']}:{participant_id}",
+                action_url=f"/?tab=roster&trip={trip['id']}",
+            )
     await audit(database, user["id"], "trip.created", group_id, trip["id"], {"child_ids": [str(x) for x in payload.child_ids]})
     return await serialize_trip(database, user["id"], trip)
 
@@ -1385,8 +1916,19 @@ async def list_trips(group_id: UUID, user: UserDep, database: DbDep, from_date: 
         WHERE t.group_id = $1
           AND t.service_date >= $2
           AND ($3::date IS NULL OR t.service_date <= $3)
-          AND t.status NOT IN ('completed', 'cancelled', 'driver_unavailable')
-          AND (t.driver_user_id = $4 OR c.parent_id = $4 OR t.created_by = $4)
+          AND t.status NOT IN ('completed', 'cancelled', 'driver_unavailable', 'ignored')
+          AND (
+              t.driver_user_id = $4
+              OR c.parent_id = $4
+              OR t.created_by = $4
+              OR EXISTS (
+                  SELECT 1
+                  FROM roster_change_requests rcr
+                  WHERE rcr.trip_id = t.id
+                    AND rcr.proposed_driver_user_id = $4
+                    AND rcr.request_type = 'swap'
+              )
+          )
         ORDER BY t.service_date, t.expected_time
         """,
         group_id,
@@ -1394,7 +1936,7 @@ async def list_trips(group_id: UUID, user: UserDep, database: DbDep, from_date: 
         to_date,
         UUID(user["id"]),
     )
-    return [await serialize_trip(database, user["id"], row) for row in rows]
+    return await serialize_trips(database, user["id"], list(rows))
 
 
 @app.get("/api/groups/{group_id}/trips/history")
@@ -1407,7 +1949,7 @@ async def list_trip_history(group_id: UUID, user: UserDep, database: DbDep) -> l
         LEFT JOIN trip_children tc ON tc.trip_id = t.id
         LEFT JOIN children c ON c.id = tc.child_id
         WHERE t.group_id = $1
-          AND (t.service_date < CURRENT_DATE OR t.status IN ('completed', 'cancelled', 'driver_unavailable'))
+          AND (t.service_date < CURRENT_DATE OR t.status IN ('completed', 'cancelled', 'driver_unavailable', 'ignored'))
           AND (t.driver_user_id = $2 OR c.parent_id = $2 OR t.created_by = $2)
         ORDER BY t.service_date DESC, t.expected_time DESC
         LIMIT 200
@@ -1415,13 +1957,67 @@ async def list_trip_history(group_id: UUID, user: UserDep, database: DbDep) -> l
         group_id,
         UUID(user["id"]),
     )
-    return [await serialize_trip(database, user["id"], row) for row in rows]
+    return await serialize_trips(database, user["id"], list(rows))
 
 
 @app.get("/api/trips/{trip_id}")
 async def get_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await trip_with_permission(database, user["id"], trip_id)
     return await serialize_trip(database, user["id"], trip)
+
+
+@app.delete("/api/trips/{trip_id}")
+async def delete_roster(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str, str]:
+    trip = await trip_with_permission(database, user["id"], trip_id)
+    if trip["created_by"] != UUID(user["id"]):
+        creator = await database.fetchval("SELECT created_by FROM carpool_groups WHERE id = $1", trip["group_id"])
+        if creator != UUID(user["id"]):
+            raise HTTPException(status_code=403, detail="Only the roster creator can delete an unaccepted roster")
+    if trip["status"] != "planned":
+        raise HTTPException(status_code=409, detail="Only planned, unaccepted rosters can be deleted")
+    accepted = await database.fetchval(
+        "SELECT 1 FROM trip_responses WHERE trip_id = $1 AND status = 'accepted' LIMIT 1",
+        trip_id,
+    )
+    if accepted:
+        raise HTTPException(status_code=409, detail="Accepted rosters cannot be deleted")
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            updated = await conn.fetchrow(
+                """
+                UPDATE trips
+                SET status = 'ignored',
+                    cancellation_reason = 'Roster deleted before driver acceptance'
+                WHERE id = $1 AND status = 'planned'
+                RETURNING *
+                """,
+                trip_id,
+            )
+            if not updated:
+                raise HTTPException(status_code=409, detail="Roster can no longer be deleted")
+            await conn.execute(
+                "UPDATE roster_change_requests SET status = 'cancelled' WHERE trip_id = $1 AND status = 'open'",
+                trip_id,
+            )
+            await conn.execute(
+                """
+                UPDATE notifications
+                SET read_at = COALESCE(read_at, now())
+                WHERE entity_type = 'trip' AND entity_id = $1 AND read_at IS NULL
+                """,
+                trip_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO audit_records (actor_user_id, group_id, trip_id, action, details)
+                VALUES ($1, $2, $3, 'trip.deleted', $4::jsonb)
+                """,
+                UUID(user["id"]),
+                trip["group_id"],
+                trip_id,
+                json.dumps({"status": "ignored", "reason": "deleted_before_acceptance"}),
+            )
+    return {"status": "deleted"}
 
 
 @app.post("/api/trips/{trip_id}/responses")
@@ -1433,7 +2029,7 @@ async def respond_trip(trip_id: UUID, payload: TripResponseIn, user: UserDep, da
         """
         INSERT INTO trip_responses (trip_id, user_id, status, note)
         VALUES ($1, $2, $3, $4)
-        ON CONFLICT (trip_id, user_id) DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note, created_at = now()
+        ON CONFLICT (trip_id, user_id) DO NOTHING
         RETURNING *
         """,
         trip_id,
@@ -1441,16 +2037,88 @@ async def respond_trip(trip_id: UUID, payload: TripResponseIn, user: UserDep, da
         payload.status,
         payload.note,
     )
+    if not row:
+        raise HTTPException(status_code=409, detail="Trip assignment already decided")
     await notify(database, trip["created_by"], "roster_response", "Roster response", f"{user['name']} {payload.status} a roster assignment.", "trip", trip_id)
     await audit(database, user["id"], "trip.response", trip["group_id"], trip_id, {"status": payload.status})
     return row_to_dict(row) or {}
 
 
+@app.get("/api/trips/{trip_id}/eligible-swap-drivers")
+async def eligible_swap_drivers(trip_id: UUID, user: UserDep, database: DbDep) -> list[dict[str, Any]]:
+    trip = await require_trip_driver(database, user["id"], trip_id)
+    rows = await database.fetch(
+        """
+        SELECT u.id, u.name, u.email, u.phone
+        FROM group_members gm
+        JOIN users u ON u.id = gm.user_id
+        WHERE gm.group_id = $1
+          AND gm.status = 'active'
+          AND gm.user_id <> $2
+          AND NOT EXISTS (
+              SELECT 1
+              FROM trip_children tc
+              LEFT JOIN driver_approvals da
+                ON da.group_id = $1
+               AND da.child_id = tc.child_id
+               AND da.driver_user_id = gm.user_id
+               AND da.approved = true
+              WHERE tc.trip_id = $3
+                AND da.id IS NULL
+          )
+        ORDER BY u.name
+        """,
+        trip["group_id"],
+        trip["driver_user_id"],
+        trip_id,
+    )
+    return rows_to_list(rows)
+
+
 @app.post("/api/trips/{trip_id}/change-requests")
 async def request_roster_change(trip_id: UUID, payload: ChangeRequestIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await trip_with_permission(database, user["id"], trip_id)
+    if payload.request_type == "swap":
+        if trip["driver_user_id"] != UUID(user["id"]):
+            raise HTTPException(status_code=403, detail="Only the assigned driver can request a swap")
+        if trip["status"] not in {"planned", "delayed"}:
+            raise HTTPException(status_code=409, detail="Swap requests are only available before a trip starts")
+        if not payload.proposed_driver_user_id:
+            raise HTTPException(status_code=400, detail="Choose a proposed replacement driver")
+        if payload.proposed_driver_user_id == trip["driver_user_id"]:
+            raise HTTPException(status_code=400, detail="Choose a different replacement driver")
+        existing_open_swap = await database.fetchval(
+            """
+            SELECT 1
+            FROM roster_change_requests
+            WHERE trip_id = $1 AND request_type = 'swap' AND status = 'open'
+            LIMIT 1
+            """,
+            trip_id,
+        )
+        if existing_open_swap:
+            raise HTTPException(status_code=409, detail="A swap request is already open for this trip")
     if payload.proposed_driver_user_id:
         await require_group_member(database, payload.proposed_driver_user_id, trip["group_id"])
+        missing_approval = await database.fetchval(
+            """
+            SELECT 1
+            FROM trip_children tc
+            LEFT JOIN driver_approvals da
+              ON da.group_id = $1
+             AND da.child_id = tc.child_id
+             AND da.driver_user_id = $2
+             AND da.approved = true
+            WHERE tc.trip_id = $3
+              AND da.id IS NULL
+            LIMIT 1
+            """,
+            trip["group_id"],
+            payload.proposed_driver_user_id,
+            trip_id,
+        )
+        if missing_approval:
+            raise HTTPException(status_code=403, detail="Proposed driver is not approved for every child on this trip")
     row = await database.fetchrow(
         """
         INSERT INTO roster_change_requests (trip_id, requested_by, request_type, proposed_driver_user_id, note)
@@ -1463,8 +2131,145 @@ async def request_roster_change(trip_id: UUID, payload: ChangeRequestIn, user: U
         payload.proposed_driver_user_id,
         payload.note,
     )
-    await notify(database, trip["created_by"], "roster_change", "Roster change requested", payload.note, "trip", trip_id)
-    await audit(database, user["id"], "trip.change_requested", trip["group_id"], trip_id, {"request_type": payload.request_type})
+    request_id = row["id"]
+    if trip["created_by"] != UUID(user["id"]):
+        await notify(
+            database,
+            trip["created_by"],
+            "trip_swap_request",
+            "Trip swap requested",
+            f"{user['name']} requested a swap for {trip_label(trip)}. {payload.note}",
+            "trip",
+            trip_id,
+            email=True,
+            idempotency_key=f"swap_request:{request_id}:organiser:{trip['created_by']}",
+            action_url=f"/?tab=trip&trip={trip_id}",
+        )
+    if payload.proposed_driver_user_id:
+        await notify(
+            database,
+            payload.proposed_driver_user_id,
+            "trip_swap_request",
+            "Trip swap request received",
+            f"{user['name']} asked you to cover {trip_label(trip)}. Review and confirm before anything changes.",
+            "trip",
+            trip_id,
+            email=True,
+            idempotency_key=f"swap_request:{request_id}:driver:{payload.proposed_driver_user_id}",
+            action_url=f"/?tab=trip&trip={trip_id}&swap_request={request_id}",
+    )
+    await audit(
+        database,
+        user["id"],
+        "trip.change_requested",
+        trip["group_id"],
+        trip_id,
+        {"request_type": payload.request_type, "proposed_driver_user_id": str(payload.proposed_driver_user_id) if payload.proposed_driver_user_id else None, "request_id": str(request_id)},
+    )
+    return row_to_dict(row) or {}
+
+
+@app.get("/api/trips/{trip_id}/change-requests")
+async def list_trip_change_requests(trip_id: UUID, user: UserDep, database: DbDep) -> list[dict[str, Any]]:
+    trip = await trip_with_permission(database, user["id"], trip_id)
+    rows = await database.fetch(
+        """
+        SELECT rcr.*, requester.name AS requester_name, proposed.name AS proposed_driver_name
+        FROM roster_change_requests rcr
+        JOIN users requester ON requester.id = rcr.requested_by
+        LEFT JOIN users proposed ON proposed.id = rcr.proposed_driver_user_id
+        WHERE rcr.trip_id = $1
+          AND (rcr.requested_by = $2 OR rcr.proposed_driver_user_id = $2 OR $2 = $3)
+        ORDER BY rcr.created_at DESC
+        """,
+        trip_id,
+        UUID(user["id"]),
+        trip["created_by"],
+    )
+    return rows_to_list(rows)
+
+
+@app.post("/api/roster-change-requests/{request_id}/decision")
+async def decide_roster_change(request_id: UUID, payload: ChangeRequestDecisionIn, user: UserDep, database: DbDep) -> dict[str, Any]:
+    request = await database.fetchrow(
+        """
+        SELECT rcr.*, t.group_id, t.driver_user_id, t.service_date, t.trip_type, t.expected_time, t.created_by
+        FROM roster_change_requests rcr
+        JOIN trips t ON t.id = rcr.trip_id
+        WHERE rcr.id = $1
+        """,
+        request_id,
+    )
+    if not request:
+        raise HTTPException(status_code=404, detail="Swap request not found")
+    await require_group_member(database, user["id"], request["group_id"])
+    if request["request_type"] == "swap" and request["proposed_driver_user_id"] != UUID(user["id"]):
+        raise HTTPException(status_code=403, detail="Only the proposed replacement driver can decide this swap")
+    if request["status"] != "open":
+        raise HTTPException(status_code=409, detail="Swap request already decided")
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE roster_change_requests
+                SET status = $2, note = COALESCE($3, note)
+                WHERE id = $1 AND status = 'open'
+                RETURNING *
+                """,
+                request_id,
+                payload.status,
+                payload.note,
+            )
+            if not row:
+                raise HTTPException(status_code=409, detail="Swap request already decided")
+            if payload.status == "accepted" and request["request_type"] == "swap" and request["proposed_driver_user_id"]:
+                await conn.execute(
+                    "UPDATE trips SET driver_user_id = $2 WHERE id = $1",
+                    request["trip_id"],
+                    request["proposed_driver_user_id"],
+                )
+                await conn.execute(
+                    """
+                    UPDATE roster_change_requests
+                    SET status = 'cancelled'
+                    WHERE trip_id = $1 AND id <> $2 AND status = 'open'
+                    """,
+                    request["trip_id"],
+                    request_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO trip_responses (trip_id, user_id, status, note)
+                    VALUES ($1, $2, 'accepted', $3)
+                    ON CONFLICT (trip_id, user_id)
+                    DO UPDATE SET status = 'accepted', note = EXCLUDED.note, created_at = now()
+                    """,
+                    request["trip_id"],
+                    request["proposed_driver_user_id"],
+                    payload.note or "Accepted trip swap request.",
+                )
+    recipients = {request["requested_by"], request["created_by"]}
+    for recipient_id in recipients:
+        await notify(
+            database,
+            recipient_id,
+            "trip_swap_decision",
+            f"Trip swap {payload.status}",
+            f"The swap request for {trip_label(request)} was {payload.status}.",
+            "trip",
+            request["trip_id"],
+            email=True,
+            idempotency_key=f"swap_decision:{request_id}:{payload.status}:{recipient_id}",
+            action_url=f"/?tab=trip&trip={request['trip_id']}",
+        )
+    await audit(
+        database,
+        user["id"],
+        "trip.change_decided",
+        request["group_id"],
+        request["trip_id"],
+        {"request_type": request["request_type"], "request_id": str(request_id), "status": payload.status},
+    )
     return row_to_dict(row) or {}
 
 
@@ -1473,6 +2278,19 @@ async def start_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
     trip = await require_trip_driver(database, user["id"], trip_id)
     if trip["status"] not in {"planned", "delayed"}:
         raise HTTPException(status_code=409, detail="Trip cannot be started from its current status")
+    if trip["service_date"] != date.today():
+        raise HTTPException(status_code=409, detail="Trip can only be started on its service date")
+    accepted = await database.fetchval(
+        """
+        SELECT 1
+        FROM trip_responses
+        WHERE trip_id = $1 AND user_id = $2 AND status = 'accepted'
+        """,
+        trip_id,
+        UUID(user["id"]),
+    )
+    if not accepted:
+        raise HTTPException(status_code=409, detail="Accept this trip before starting it")
     updated = await database.fetchrow(
         """
         UPDATE trips
@@ -1491,7 +2309,18 @@ async def start_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
         trip_id,
     )
     for parent in parent_ids:
-        await notify(database, parent["parent_id"], "trip_start", "Trip started", "The assigned driver started the carpool trip.", "trip", trip_id)
+        await notify(
+            database,
+            parent["parent_id"],
+            "trip_start",
+            "Trip started",
+            f"The assigned driver started {trip_label(updated)}.",
+            "trip",
+            trip_id,
+            email=True,
+            idempotency_key=f"trip_start:{trip_id}:{parent['parent_id']}",
+            action_url=f"/?tab=trip&trip={trip_id}",
+        )
     await audit(database, user["id"], "trip.started", trip["group_id"], trip_id)
     return await serialize_trip(database, user["id"], updated)
 
@@ -1508,7 +2337,18 @@ async def end_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str, A
         trip_id,
     )
     for parent in parent_ids:
-        await notify(database, parent["parent_id"], "trip_end", "Trip ended", "Location sharing has stopped for this trip.", "trip", trip_id)
+        await notify(
+            database,
+            parent["parent_id"],
+            "trip_end",
+            "Trip ended",
+            f"Location sharing has stopped for {trip_label(updated)}.",
+            "trip",
+            trip_id,
+            email=True,
+            idempotency_key=f"trip_end:{trip_id}:{parent['parent_id']}",
+            action_url=f"/?tab=trip&trip={trip_id}",
+        )
     await audit(database, user["id"], "trip.ended", trip["group_id"], trip_id)
     return await serialize_trip(database, user["id"], updated)
 
@@ -1521,9 +2361,19 @@ async def cancel_trip(trip_id: UUID, payload: TripNoteIn, user: UserDep, databas
         trip_id,
         payload.reason or payload.note,
     )
-    members = await database.fetch("SELECT user_id FROM group_members WHERE group_id = $1 AND status = 'active'", trip["group_id"])
-    for member in members:
-        await notify(database, member["user_id"], "trip_cancelled", "Trip cancelled", payload.reason or "A carpool trip was cancelled.", "trip", trip_id)
+    for recipient_id in await affected_trip_user_ids(database, trip):
+        await notify(
+            database,
+            recipient_id,
+            "trip_cancelled",
+            "Trip cancelled",
+            payload.reason or f"{trip_label(updated)} was cancelled.",
+            "trip",
+            trip_id,
+            email=True,
+            idempotency_key=f"trip_cancelled:{trip_id}:{recipient_id}",
+            action_url=f"/?tab=trip&trip={trip_id}",
+        )
     await audit(database, user["id"], "trip.cancelled", trip["group_id"], trip_id)
     return await serialize_trip(database, user["id"], updated)
 
@@ -1531,16 +2381,30 @@ async def cancel_trip(trip_id: UUID, payload: TripNoteIn, user: UserDep, databas
 @app.post("/api/trips/{trip_id}/delay")
 async def delay_trip(trip_id: UUID, payload: TripNoteIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await require_trip_driver(database, user["id"], trip_id)
+    if trip["status"] not in {"planned", "delayed", "started"} or trip["service_date"] < date.today():
+        raise HTTPException(status_code=409, detail="Delay can only be reported for an active or upcoming trip")
+    minutes = payload.minutes or 10
     updated = await database.fetchrow(
         "UPDATE trips SET status = 'delayed', delay_minutes = $2, delay_note = $3 WHERE id = $1 RETURNING *",
         trip_id,
-        payload.minutes or 10,
-        payload.note,
+        minutes,
+        payload.note or f"Driver reported a {minutes}-minute delay.",
     )
-    parent_ids = await database.fetch("SELECT DISTINCT c.parent_id FROM trip_children tc JOIN children c ON c.id = tc.child_id WHERE tc.trip_id = $1", trip_id)
-    for parent in parent_ids:
-        await notify(database, parent["parent_id"], "delay", "Trip delayed", payload.note or f"Driver reported a {payload.minutes or 10} minute delay.", "trip", trip_id)
-    await audit(database, user["id"], "trip.delayed", trip["group_id"], trip_id, {"minutes": payload.minutes or 10})
+    body = payload.note or f"Driver reported a {minutes}-minute delay for {trip_label(updated)}."
+    for recipient_id in await affected_trip_user_ids(database, updated, include_driver=False):
+        await notify(
+            database,
+            recipient_id,
+            "delay",
+            "Trip delayed",
+            body,
+            "trip",
+            trip_id,
+            email=True,
+            idempotency_key=f"trip_delay:{trip_id}:{minutes}:{recipient_id}",
+            action_url=f"/?tab=trip&trip={trip_id}",
+        )
+    await audit(database, user["id"], "trip.delayed", trip["group_id"], trip_id, {"minutes": minutes})
     return await serialize_trip(database, user["id"], updated)
 
 
@@ -1548,9 +2412,19 @@ async def delay_trip(trip_id: UUID, payload: TripNoteIn, user: UserDep, database
 async def driver_unavailable(trip_id: UUID, payload: TripNoteIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await require_trip_driver(database, user["id"], trip_id)
     updated = await database.fetchrow("UPDATE trips SET status = 'driver_unavailable', delay_note = $2 WHERE id = $1 RETURNING *", trip_id, payload.note)
-    members = await database.fetch("SELECT user_id FROM group_members WHERE group_id = $1 AND status = 'active'", trip["group_id"])
-    for member in members:
-        await notify(database, member["user_id"], "driver_unavailable", "Driver unavailable", payload.note or "The assigned driver is unavailable.", "trip", trip_id)
+    for recipient_id in await affected_trip_user_ids(database, updated):
+        await notify(
+            database,
+            recipient_id,
+            "driver_unavailable",
+            "Driver unavailable",
+            payload.note or f"The assigned driver is unavailable for {trip_label(updated)}.",
+            "trip",
+            trip_id,
+            email=True,
+            idempotency_key=f"driver_unavailable:{trip_id}:{recipient_id}",
+            action_url=f"/?tab=trip&trip={trip_id}",
+        )
     await audit(database, user["id"], "trip.driver_unavailable", trip["group_id"], trip_id)
     return await serialize_trip(database, user["id"], updated)
 
@@ -1591,6 +2465,7 @@ async def handover(trip_id: UUID, child_id: UUID, payload: HandoverIn, user: Use
         trip_id,
         email=True,
         idempotency_key=f"handover:{trip_id}:{child_id}:{payload.handover_type}",
+        action_url=f"/?tab=trip&trip={trip_id}",
     )
     await audit(database, user["id"], "trip.handover", trip["group_id"], trip_id, {"child_id": str(child_id), "handover_type": payload.handover_type})
     return row_to_dict(row) or {}
@@ -1798,6 +2673,25 @@ async def mark_notification_read(notification_id: UUID, user: UserDep, database:
         UUID(user["id"]),
     )
     return {"status": "ok"}
+
+
+@app.delete("/api/notifications/read")
+async def delete_read_notifications(user: UserDep, database: DbDep) -> dict[str, str]:
+    await database.execute(
+        "DELETE FROM notifications WHERE user_id = $1 AND read_at IS NOT NULL",
+        UUID(user["id"]),
+    )
+    return {"status": "deleted"}
+
+
+@app.delete("/api/notifications/{notification_id}")
+async def delete_notification(notification_id: UUID, user: UserDep, database: DbDep) -> dict[str, str]:
+    await database.execute(
+        "DELETE FROM notifications WHERE id = $1 AND user_id = $2",
+        notification_id,
+        UUID(user["id"]),
+    )
+    return {"status": "deleted"}
 
 
 @app.get("/api/audit")
