@@ -32,12 +32,18 @@ const state = {
   notificationSwipe: null,
   knownNotificationIds: new Set(),
   notificationIdsSeeded: false,
+  nativePushListenerRegistered: false,
 };
 
 let notificationAudioContext = null;
 let notificationAudioElement = null;
 
 const $ = (id) => document.getElementById(id);
+const nativeConfig = window.SCHOOLHOP_NATIVE_CONFIG || {};
+const nativeApiBaseUrl = nativeConfig.apiBaseUrl ? String(nativeConfig.apiBaseUrl).replace(/\/$/, "") : "";
+const nativeAppVersion = nativeConfig.appVersion || "";
+const isNativeApp = Boolean(window.Capacitor && typeof window.Capacitor.isNativePlatform === "function" && window.Capacitor.isNativePlatform());
+const nativePlugins = () => (window.Capacitor && window.Capacitor.Plugins) || {};
 const escapeHTML = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({
   "&": "&amp;",
   "<": "&lt;",
@@ -57,7 +63,7 @@ async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
   const started = performance.now();
-  const response = await fetch(path, { ...options, headers, cache: "no-store" });
+  const response = await fetch(apiUrl(path), { ...options, headers, cache: "no-store" });
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
   const duration = performance.now() - started;
@@ -68,8 +74,13 @@ async function api(path, options = {}) {
   return data;
 }
 
+function apiUrl(path) {
+  if (!isNativeApp || !nativeApiBaseUrl || !path.startsWith("/")) return path;
+  return `${nativeApiBaseUrl}${path}`;
+}
+
 function reportClientError(error, context = {}) {
-  fetch("/api/client-errors", {
+  fetch(apiUrl("/api/client-errors"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -199,14 +210,17 @@ function mapLocation(trip) {
 
 async function init() {
   state.config = await api("/api/config").catch(() => ({}));
+  if (nativeAppVersion) state.config.app_version = nativeAppVersion;
   hydrateUrlActions();
   wireEvents();
+  wireNativeEvents();
   registerServiceWorker();
   await refresh();
+  await registerNativePushToken();
 }
 
 function registerServiceWorker() {
-  if ("serviceWorker" in navigator) {
+  if (!isNativeApp && "serviceWorker" in navigator) {
     navigator.serviceWorker.register("/static/service-worker.js").catch(() => undefined);
   }
 }
@@ -420,6 +434,7 @@ function setToken(token) {
   state.knownNotificationIds = new Set();
   state.notificationIdsSeeded = false;
   localStorage.setItem("schoolhop_token", token);
+  registerNativePushToken().catch((error) => reportClientError(error, { source: "native-push-register" }));
 }
 
 function submit(formId, handler, doRefresh = true) {
@@ -466,7 +481,7 @@ async function refresh() {
     }),
   ]);
   state.me = meResult.user;
-  $("sessionSummary").textContent = state.me.email;
+  $("sessionSummary").textContent = nativeAppVersion ? `${state.me.email} · v${nativeAppVersion}` : state.me.email;
   state.schools = schoolsResult;
   state.groups = groups;
   state.discoverGroups = discoverGroupsResult;
@@ -485,6 +500,7 @@ async function refreshGroupContext() {
     state.group = null;
     state.groupChildren = [];
     state.trips = [];
+    stopTrackingIfNoLongerAllowed();
     state.history = [];
     state.historyLoaded = false;
     state.historyLoading = false;
@@ -521,6 +537,7 @@ async function refreshGroupContext() {
   state.group = group;
   state.groupChildren = groupChildrenResult;
   state.trips = trips;
+  stopTrackingIfNoLongerAllowed();
   const notifications = settledValue(notificationsResult, state.notifications, "notifications-refresh");
   const pendingActions = settledValue(pendingActionsResult, state.pendingActions, "pending-actions-refresh");
   setNotifications(notifications);
@@ -541,6 +558,13 @@ function chooseSelectedTrip() {
     state.selectedTripId = null;
     localStorage.removeItem("schoolhop_selected_trip");
   }
+}
+
+function stopTrackingIfNoLongerAllowed() {
+  if (!state.trackingTripId) return;
+  const trackedTrip = state.trips.find((trip) => trip.id === state.trackingTripId);
+  if (trackedTrip && trackedTrip.status === "started" && isDriver(trackedTrip)) return;
+  stopTracking();
 }
 
 async function loadTripHistory() {
@@ -1263,6 +1287,13 @@ async function endTrip() {
 }
 
 async function startTracking(tripId) {
+  if (isNativeApp) {
+    await startNativeTracking(tripId);
+    state.trackingTripId = tripId;
+    state.watchId = "native";
+    renderTripConsole();
+    return;
+  }
   if (!("geolocation" in navigator)) throw new Error("Geolocation is not supported in this browser");
   stopTracking();
   state.trackingTripId = tripId;
@@ -1275,7 +1306,11 @@ async function startTracking(tripId) {
 }
 
 function stopTracking() {
-  if (state.watchId !== null) navigator.geolocation.clearWatch(state.watchId);
+  if (state.watchId === "native") {
+    stopNativeTracking().catch((error) => reportClientError(error, { source: "native-location-stop" }));
+  } else if (state.watchId !== null) {
+    navigator.geolocation.clearWatch(state.watchId);
+  }
   state.watchId = null;
   state.trackingTripId = null;
   if (state.locationPostTimer !== null) window.clearTimeout(state.locationPostTimer);
@@ -1552,6 +1587,82 @@ async function openActionUrl(actionUrl) {
   const tab = url.searchParams.get("tab");
   if (tab) setTab(tab);
   renderAll();
+}
+
+function wireNativeEvents() {
+  if (!isNativeApp) return;
+  const { App, PushNotifications } = nativePlugins();
+  if (App && typeof App.addListener === "function") {
+    App.addListener("appUrlOpen", (event) => {
+      if (event && event.url) openActionUrl(event.url).catch((error) => reportClientError(error, { source: "native-url-open" }));
+    });
+  }
+  if (PushNotifications && typeof PushNotifications.addListener === "function") {
+    PushNotifications.addListener("pushNotificationActionPerformed", (event) => {
+      const data = event && event.notification && event.notification.data ? event.notification.data : {};
+      const actionUrl = data.action_url || data.url || "";
+      if (actionUrl) openActionUrl(actionUrl).catch((error) => reportClientError(error, { source: "native-push-action" }));
+    });
+  }
+  const { SchoolHopLocation } = nativePlugins();
+  if (SchoolHopLocation && typeof SchoolHopLocation.addListener === "function") {
+    SchoolHopLocation.addListener("trackingStopped", (event) => {
+      clearLocalTrackingState();
+      refreshGroupContext().catch((error) => reportClientError(error, { source: "native-location-stopped", status: event && event.status }));
+      toast("Location sharing stopped for this trip.");
+    });
+    SchoolHopLocation.addListener("trackingError", (event) => {
+      const message = event && event.message ? event.message : "Native location tracking failed";
+      reportClientError(new Error(message), { source: "native-location-tracking" });
+    });
+  }
+}
+
+async function registerNativePushToken() {
+  if (!isNativeApp || !state.token) return;
+  const { PushNotifications } = nativePlugins();
+  if (!PushNotifications) return;
+  const permission = await PushNotifications.requestPermissions();
+  if (!permission || permission.receive !== "granted") return;
+  if (!state.nativePushListenerRegistered) {
+    await PushNotifications.addListener("registration", async (token) => {
+      const value = token && (token.value || token.token);
+      if (!value) return;
+      await api("/api/mobile/devices", {
+        method: "POST",
+        body: JSON.stringify({ provider: "apns", token: value, platform: "ios" }),
+      });
+    });
+    await PushNotifications.addListener("registrationError", (error) => {
+      reportClientError(new Error(error && error.error ? error.error : "APNs registration failed"), { source: "native-push-registration" });
+    });
+    state.nativePushListenerRegistered = true;
+  }
+  await PushNotifications.register();
+}
+
+async function startNativeTracking(tripId) {
+  const { SchoolHopLocation } = nativePlugins();
+  if (!SchoolHopLocation) throw new Error("Native location service is unavailable");
+  await SchoolHopLocation.startTripTracking({
+    tripId,
+    token: state.token,
+    apiBaseUrl: nativeApiBaseUrl || window.location.origin,
+  });
+}
+
+async function stopNativeTracking() {
+  const { SchoolHopLocation } = nativePlugins();
+  if (SchoolHopLocation) await SchoolHopLocation.stopTripTracking();
+}
+
+function clearLocalTrackingState() {
+  state.watchId = null;
+  state.trackingTripId = null;
+  if (state.locationPostTimer !== null) window.clearTimeout(state.locationPostTimer);
+  state.locationPostTimer = null;
+  state.queuedLocationPost = null;
+  renderTripConsole();
 }
 
 window.setInterval(() => {

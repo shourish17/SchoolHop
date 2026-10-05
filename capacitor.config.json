@@ -1,0 +1,20 @@
+{
+  "appId": "com.schoolhop.app",
+  "appName": "SchoolHop",
+  "webDir": "build/capacitor",
+  "server": {
+    "iosScheme": "https",
+    "hostname": "localhost"
+  },
+  "ios": {
+    "contentInset": "automatic"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    },
+    "PushNotifications": {
+      "presentationOptions": ["badge", "sound", "alert"]
+    }
+  }
+}

@@ -1,0 +1,632 @@
+name: iOS TestFlight Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: Optional CFBundleVersion override. Defaults to the GitHub run number.
+        required: false
+        type: string
+      marketing_version:
+        description: Optional CFBundleShortVersionString override, for example 1.0.1.
+        required: false
+        type: string
+      upload_to_testflight:
+        description: Upload the exported IPA to App Store Connect.
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: schoolhop-ios-testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    runs-on: macos-15
+    environment: testflight
+    env:
+      WORKSPACE_PATH: ios/App/App.xcworkspace
+      PROJECT_PATH: ios/App/App.xcodeproj
+      SCHEME: App
+      BUNDLE_ID: com.schoolhop.app
+      ARCHIVE_PATH: build/SchoolHop.xcarchive
+      EXPORT_PATH: build/export
+      LOG_DIR: build/xcode-logs
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show macOS and Xcode versions
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Verify required TestFlight secrets
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64 }}
+          IOS_DISTRIBUTION_CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          missing=0
+          for name in \
+            APP_STORE_CONNECT_KEY_ID \
+            APP_STORE_CONNECT_ISSUER_ID \
+            APP_STORE_CONNECT_API_KEY_P8 \
+            APPLE_TEAM_ID \
+            IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64 \
+            IOS_DISTRIBUTION_CERTIFICATE_PASSWORD \
+            IOS_KEYCHAIN_PASSWORD
+          do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required testflight environment secret: ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Prepare App Store version values
+        env:
+          REQUESTED_BUILD_NUMBER: ${{ inputs.build_number }}
+          REQUESTED_MARKETING_VERSION: ${{ inputs.marketing_version }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+
+          MARKETING_VERSION="${REQUESTED_MARKETING_VERSION:-}"
+
+          if [ -n "$REQUESTED_BUILD_NUMBER" ] && ! [[ "$REQUESTED_BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::build_number must contain digits only."
+            exit 1
+          fi
+
+          if [ -n "$MARKETING_VERSION" ] && ! [[ "$MARKETING_VERSION" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+            echo "::error::marketing_version must look like 1, 1.0, or 1.0.1."
+            exit 1
+          fi
+
+          LATEST_TESTFLIGHT_BUILD=$(ruby <<'RUBY'
+          require "base64"
+          require "json"
+          require "net/http"
+          require "openssl"
+          require "time"
+          require "uri"
+
+          def b64url(value)
+            Base64.urlsafe_encode64(value).delete("=")
+          end
+
+          def jwt_token(key_id:, issuer_id:, private_key:)
+            key = OpenSSL::PKey::EC.new(private_key)
+            header = {"alg" => "ES256", "kid" => key_id, "typ" => "JWT"}
+            now = Time.now.to_i
+            claims = {"iss" => issuer_id, "iat" => now, "exp" => now + 1200, "aud" => "appstoreconnect-v1"}
+            signing_input = "#{b64url(JSON.generate(header))}.#{b64url(JSON.generate(claims))}"
+            digest = OpenSSL::Digest::SHA256.digest(signing_input)
+            der = key.dsa_sign_asn1(digest)
+            sequence = OpenSSL::ASN1.decode(der)
+            r = sequence.value[0].value.to_s(2).rjust(32, "\x00")[-32, 32]
+            s = sequence.value[1].value.to_s(2).rjust(32, "\x00")[-32, 32]
+            "#{signing_input}.#{b64url(r + s)}"
+          end
+
+          def api_request(token, path)
+            uri = URI("https://api.appstoreconnect.apple.com#{path}")
+            request = Net::HTTP::Get.new(uri)
+            request["Authorization"] = "Bearer #{token}"
+            response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(request) }
+            unless response.code.to_i.between?(200, 299)
+              warn response.body
+              raise "App Store Connect API Get #{path} failed with HTTP #{response.code}"
+            end
+            JSON.parse(response.body)
+          end
+
+          token = jwt_token(
+            key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+            issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+            private_key: ENV.fetch("APP_STORE_CONNECT_API_KEY_P8").gsub("\\n", "\n"),
+          )
+          bundle_id = URI.encode_www_form_component(ENV.fetch("BUNDLE_ID"))
+          apps = api_request(token, "/v1/apps?filter[bundleId]=#{bundle_id}&limit=1").fetch("data")
+          raise "App Store Connect app was not found for #{ENV.fetch("BUNDLE_ID")}" if apps.empty?
+          app_id = apps.first.fetch("id")
+          builds = api_request(token, "/v1/builds?filter[app]=#{app_id}&sort=-version&limit=1").fetch("data")
+          puts(builds.empty? ? "0" : builds.first.fetch("attributes").fetch("version"))
+          RUBY
+          )
+
+          if ! [[ "$LATEST_TESTFLIGHT_BUILD" =~ ^[0-9]+$ ]]; then
+            echo "::error::Latest TestFlight build number is not numeric: $LATEST_TESTFLIGHT_BUILD"
+            exit 1
+          fi
+
+          MIN_BUILD_NUMBER=$((LATEST_TESTFLIGHT_BUILD + 1))
+          DEFAULT_BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          if [ "$DEFAULT_BUILD_NUMBER" -lt "$MIN_BUILD_NUMBER" ]; then
+            DEFAULT_BUILD_NUMBER="$MIN_BUILD_NUMBER"
+          fi
+          BUILD_NUMBER="${REQUESTED_BUILD_NUMBER:-$DEFAULT_BUILD_NUMBER}"
+
+          if [ "$BUILD_NUMBER" -lt "$MIN_BUILD_NUMBER" ]; then
+            echo "::error::build_number must be greater than latest TestFlight/App Store Connect build $LATEST_TESTFLIGHT_BUILD."
+            exit 1
+          fi
+
+          {
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+            echo "MARKETING_VERSION=$MARKETING_VERSION"
+            echo "LATEST_TESTFLIGHT_BUILD=$LATEST_TESTFLIGHT_BUILD"
+          } >> "$GITHUB_ENV"
+
+          echo "Latest TestFlight/App Store Connect build is $LATEST_TESTFLIGHT_BUILD"
+          echo "Using iOS build number $BUILD_NUMBER"
+          if [ -n "$MARKETING_VERSION" ]; then
+            echo "Using iOS marketing version $MARKETING_VERSION"
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run frontend typecheck
+        run: npm run typecheck
+
+      - name: Run frontend lint
+        run: npm run lint
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Run backend regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile backend modules
+        run: python -m py_compile app/main.py app/seed.py
+
+      - name: Build Capacitor web assets
+        run: npm run ios:build
+
+      - name: Validate Capacitor config
+        run: npx cap config
+
+      - name: Sync Capacitor iOS project
+        run: npx cap sync ios
+
+      - name: Resolve CocoaPods dependencies
+        run: |
+          cd ios/App
+          pod install --repo-update
+
+      - name: Verify iOS workspace and scheme
+        run: |
+          test -d "$WORKSPACE_PATH"
+          test -d "$PROJECT_PATH"
+          test -f "$PROJECT_PATH/xcshareddata/xcschemes/$SCHEME.xcscheme"
+          xcodebuild -list -workspace "$WORKSPACE_PATH"
+
+      - name: Install signing certificate and provisioning profile
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64 }}
+          IOS_DISTRIBUTION_CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/signing ~/Library/MobileDevice/Provisioning\ Profiles ~/.appstoreconnect/private_keys
+
+          CERT_PATH="$RUNNER_TEMP/schoolhop-distribution.p12"
+          APP_PROFILE_PATH="$RUNNER_TEMP/schoolhop-app-store.mobileprovision"
+          APP_PROFILE_PLIST_PATH="$RUNNER_TEMP/schoolhop-app-store-profile.plist"
+          KEYCHAIN_PATH="$RUNNER_TEMP/schoolhop-signing.keychain-db"
+          ASC_KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          export CERT_PATH APP_PROFILE_PATH ASC_KEY_PATH
+
+          echo "$IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64" | base64 -D > "$CERT_PATH"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_P8" | perl -pe 's/\\n/\n/g' > "$ASC_KEY_PATH"
+          chmod 600 "$ASC_KEY_PATH"
+
+          security create-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$IOS_DISTRIBUTION_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$IOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          ruby <<'RUBY'
+          require "base64"
+          require "json"
+          require "net/http"
+          require "openssl"
+          require "time"
+          require "uri"
+
+          def b64url(value)
+            Base64.urlsafe_encode64(value).delete("=")
+          end
+
+          def jwt_token(key_id:, issuer_id:, key_path:)
+            key = OpenSSL::PKey::EC.new(File.read(key_path))
+            header = {"alg" => "ES256", "kid" => key_id, "typ" => "JWT"}
+            now = Time.now.to_i
+            claims = {"iss" => issuer_id, "iat" => now, "exp" => now + 1200, "aud" => "appstoreconnect-v1"}
+            signing_input = "#{b64url(JSON.generate(header))}.#{b64url(JSON.generate(claims))}"
+            digest = OpenSSL::Digest::SHA256.digest(signing_input)
+            der = key.dsa_sign_asn1(digest)
+            sequence = OpenSSL::ASN1.decode(der)
+            r = sequence.value[0].value.to_s(2).rjust(32, "\x00")[-32, 32]
+            s = sequence.value[1].value.to_s(2).rjust(32, "\x00")[-32, 32]
+            "#{signing_input}.#{b64url(r + s)}"
+          end
+
+          def api_request(token, method, path, body = nil)
+            uri = URI("https://api.appstoreconnect.apple.com#{path}")
+            request = Net::HTTP.const_get(method).new(uri)
+            request["Authorization"] = "Bearer #{token}"
+            request["Content-Type"] = "application/json"
+            request.body = JSON.generate(body) if body
+            response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(request) }
+            unless response.code.to_i.between?(200, 299)
+              warn response.body
+              raise "App Store Connect API #{method} #{path} failed with HTTP #{response.code}"
+            end
+            JSON.parse(response.body)
+          end
+
+          token = jwt_token(
+            key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+            issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+            key_path: ENV.fetch("ASC_KEY_PATH"),
+          )
+          cert = OpenSSL::PKCS12.new(
+            File.binread(ENV.fetch("CERT_PATH")),
+            ENV.fetch("IOS_DISTRIBUTION_CERTIFICATE_PASSWORD"),
+          ).certificate
+          local_serial = cert.serial.to_s(16).upcase
+
+          cert_response = api_request(token, "Get", "/v1/certificates?limit=200")
+          certificate = cert_response.fetch("data").find do |item|
+            item.dig("attributes", "serialNumber").to_s.upcase == local_serial
+          end
+          unless certificate
+            raise "Installed distribution certificate serial was not found in App Store Connect certificate list"
+          end
+
+          bundle_response = api_request(token, "Get", "/v1/bundleIds?filter[identifier]=#{ENV.fetch("BUNDLE_ID")}&limit=1")
+          bundle = bundle_response.fetch("data").first
+          raise "Bundle ID #{ENV.fetch("BUNDLE_ID")} was not found in Apple Developer. Create it and enable required capabilities before rerunning." unless bundle
+
+          profile_response = api_request(
+            token,
+            "Post",
+            "/v1/profiles",
+            {
+              "data" => {
+                "type" => "profiles",
+                "attributes" => {
+                  "name" => "SchoolHop App Store #{ENV.fetch("GITHUB_RUN_ID")}",
+                  "profileType" => "IOS_APP_STORE",
+                },
+                "relationships" => {
+                  "bundleId" => {"data" => {"type" => "bundleIds", "id" => bundle.fetch("id")}},
+                  "certificates" => {"data" => [{"type" => "certificates", "id" => certificate.fetch("id")}]},
+                },
+              },
+            },
+          )
+          profile_content = profile_response.dig("data", "attributes", "profileContent")
+          raise "Created provisioning profile did not include profileContent for #{ENV.fetch("BUNDLE_ID")}" if profile_content.to_s.empty?
+          File.binwrite(ENV.fetch("APP_PROFILE_PATH"), Base64.decode64(profile_content))
+          puts "Created refreshed SchoolHop App Store provisioning profile."
+          RUBY
+
+          security cms -D -i "$APP_PROFILE_PATH" > "$APP_PROFILE_PLIST_PATH"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$APP_PROFILE_PLIST_PATH")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print Name' "$APP_PROFILE_PLIST_PATH")
+          TEAM_IDENTIFIER=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' "$APP_PROFILE_PLIST_PATH")
+          APPLICATION_IDENTIFIER=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "$APP_PROFILE_PLIST_PATH")
+          PROFILE_APS_ENVIRONMENT=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:aps-environment' "$APP_PROFILE_PLIST_PATH" 2>/dev/null || true)
+
+          cp "$APP_PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
+          {
+            echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "ASC_KEY_PATH=$ASC_KEY_PATH"
+            echo "PROFILE_UUID=$PROFILE_UUID"
+            echo "PROFILE_NAME=$PROFILE_NAME"
+            echo "TEAM_IDENTIFIER=$TEAM_IDENTIFIER"
+            echo "PROFILE_APS_ENVIRONMENT=$PROFILE_APS_ENVIRONMENT"
+          } >> "$GITHUB_ENV"
+
+          if [ "$TEAM_IDENTIFIER" != "$APPLE_TEAM_ID" ]; then
+            echo "::error::Provisioning profile team ID does not match APPLE_TEAM_ID."
+            exit 1
+          fi
+
+          if [ "$APPLICATION_IDENTIFIER" != "$APPLE_TEAM_ID.$BUNDLE_ID" ]; then
+            echo "::error::Provisioning profile bundle ID does not match $BUNDLE_ID."
+            exit 1
+          fi
+
+          if [ "$PROFILE_APS_ENVIRONMENT" != "production" ]; then
+            echo "::error::Refreshed provisioning profile is missing aps-environment=production. Enable Push Notifications on $BUNDLE_ID and rerun."
+            exit 1
+          fi
+
+          echo "Installed signing certificate and refreshed SchoolHop App Store provisioning profile."
+
+      - name: Create export options
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          mkdir -p build
+          python3 - <<'PY'
+          import os
+          import plistlib
+
+          export_options = {
+              "method": "app-store-connect",
+              "teamID": os.environ["APPLE_TEAM_ID"],
+              "signingStyle": "manual",
+              "stripSwiftSymbols": True,
+              "compileBitcode": False,
+              "provisioningProfiles": {
+                  os.environ["BUNDLE_ID"]: os.environ["PROFILE_NAME"],
+              },
+          }
+
+          with open("build/ExportOptions.plist", "wb") as file:
+              plistlib.dump(export_options, file)
+          PY
+
+      - name: Configure App target signing
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project_path = Path("ios/App/App.xcodeproj/project.pbxproj")
+          content = project_path.read_text()
+
+          def object_range(text, object_id):
+              marker = f"\t\t{object_id} "
+              start = text.index(marker)
+              brace_start = text.index("{", start)
+              depth = 0
+              for index in range(brace_start, len(text)):
+                  char = text[index]
+                  if char == "{":
+                      depth += 1
+                  elif char == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = text.index(";", index) + 1
+                          return start, end
+              raise ValueError(f"Could not find object range for {object_id}")
+
+          match = re.search(
+              r"\t\t[A-F0-9]+ /\* App \*/ = \{\n\t\t\tisa = PBXNativeTarget;.*?buildConfigurationList = ([A-F0-9]+) /\* Build configuration list for PBXNativeTarget \"App\" \*/;",
+              content,
+              re.DOTALL,
+          )
+          if not match:
+              raise SystemExit("Could not find App native target in project.pbxproj")
+
+          def quote(value):
+              return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+          config_list_id = match.group(1)
+          list_start, list_end = object_range(content, config_list_id)
+          config_list = content[list_start:list_end]
+          release_match = re.search(r"([A-F0-9]+) /\* Release \*/", config_list)
+          if not release_match:
+              raise SystemExit("Could not find App Release build configuration")
+
+          release_config_id = release_match.group(1)
+          config_start, config_end = object_range(content, release_config_id)
+          config = content[config_start:config_end]
+
+          settings_start = config.index("\n\t\t\tbuildSettings = {\n") + len("\n\t\t\tbuildSettings = {\n")
+          settings_end = config.index("\n\t\t\t};", settings_start)
+          settings = config[settings_start:settings_end]
+
+          updates = {
+              "APS_ENVIRONMENT": "production",
+              "CODE_SIGN_ENTITLEMENTS": quote("App/App.entitlements"),
+              "CODE_SIGN_IDENTITY": quote("Apple Distribution"),
+              "CODE_SIGN_STYLE": "Manual",
+              "CURRENT_PROJECT_VERSION": os.environ["BUILD_NUMBER"],
+              "DEVELOPMENT_TEAM": os.environ["APPLE_TEAM_ID"],
+              "PROVISIONING_PROFILE_SPECIFIER": quote(os.environ["PROFILE_NAME"]),
+          }
+          if os.environ.get("MARKETING_VERSION"):
+              updates["MARKETING_VERSION"] = os.environ["MARKETING_VERSION"]
+
+          for key, value in updates.items():
+              pattern = re.compile(rf"(^\t\t\t\t{re.escape(key)} = ).*?;$", re.MULTILINE)
+              replacement = rf"\g<1>{value};"
+              settings, count = pattern.subn(replacement, settings)
+              if count == 0:
+                  settings += f"\n\t\t\t\t{key} = {value};"
+
+          updated_config = config[:settings_start] + settings + config[settings_end:]
+          content = content[:config_start] + updated_config + content[config_end:]
+          project_path.write_text(content)
+
+          print("Configured manual App Store signing on the SchoolHop App Release build settings.")
+          print(f"SchoolHop provisioning profile: {os.environ['PROFILE_NAME']}")
+          PY
+
+      - name: Archive signed Release build
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOG_DIR"
+
+          xcodebuild archive \
+            -workspace "$WORKSPACE_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$ARCHIVE_PATH" \
+            -destination 'generic/platform=iOS' \
+            2>&1 | tee "$LOG_DIR/archive.log"
+
+      - name: Export signed IPA
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOG_DIR" "$EXPORT_PATH"
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist build/ExportOptions.plist \
+            2>&1 | tee "$LOG_DIR/export.log"
+          ls -la "$EXPORT_PATH"
+
+      - name: Verify signed app native capabilities before upload
+        run: |
+          set -euo pipefail
+
+          IPA_PATH=$(find "$EXPORT_PATH" -maxdepth 1 -name "*.ipa" -print -quit)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No IPA was produced at $EXPORT_PATH"
+            exit 1
+          fi
+
+          VERIFY_DIR="$RUNNER_TEMP/schoolhop-signed-app"
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          unzip -q "$IPA_PATH" -d "$VERIFY_DIR"
+
+          APP_PATH=$(find "$VERIFY_DIR/Payload" -maxdepth 1 -name "*.app" -type d -print -quit)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle found in exported IPA."
+            exit 1
+          fi
+
+          ENTITLEMENTS_PLIST="$VERIFY_DIR/entitlements.plist"
+          codesign -d --entitlements :- "$APP_PATH" > "$ENTITLEMENTS_PLIST"
+          APS_ENVIRONMENT=$(/usr/libexec/PlistBuddy -c 'Print aps-environment' "$ENTITLEMENTS_PLIST" 2>/dev/null || true)
+          if [ "$APS_ENVIRONMENT" != "production" ]; then
+            echo "::error::Signed app is missing aps-environment=production."
+            exit 1
+          fi
+
+          INFO_PLIST="$APP_PATH/Info.plist"
+          DISPLAY_NAME=$(/usr/libexec/PlistBuddy -c 'Print CFBundleDisplayName' "$INFO_PLIST")
+          BUNDLE_IDENTIFIER=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$INFO_PLIST")
+          URL_SCHEME=$(/usr/libexec/PlistBuddy -c 'Print CFBundleURLTypes:0:CFBundleURLSchemes:0' "$INFO_PLIST")
+          if [ "$DISPLAY_NAME" != "SchoolHop" ]; then
+            echo "::error::Unexpected display name: $DISPLAY_NAME"
+            exit 1
+          fi
+          if [ "$BUNDLE_IDENTIFIER" != "$BUNDLE_ID" ]; then
+            echo "::error::Unexpected bundle identifier: $BUNDLE_IDENTIFIER"
+            exit 1
+          fi
+          if [ "$URL_SCHEME" != "schoolhop" ]; then
+            echo "::error::Unexpected URL scheme: $URL_SCHEME"
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c 'Print NSLocationWhenInUseUsageDescription' "$INFO_PLIST" >/dev/null
+          /usr/libexec/PlistBuddy -c 'Print NSLocationAlwaysAndWhenInUseUsageDescription' "$INFO_PLIST" >/dev/null
+          /usr/libexec/PlistBuddy -c 'Print UIBackgroundModes' "$INFO_PLIST" | grep -q location
+          /usr/libexec/PlistBuddy -c 'Print UIBackgroundModes' "$INFO_PLIST" | grep -q remote-notification
+
+          APP_BINARY="$APP_PATH/App"
+          if ! grep -a -q 'SchoolHopLocationPlugin' "$APP_BINARY"; then
+            echo "::error::SchoolHopLocationPlugin symbol was not found in the signed app binary."
+            exit 1
+          fi
+
+          if grep -R -a -q -E 'Family AI|familyai|cloud\\.familyai|group\\.cloud\\.familyai' "$APP_PATH"; then
+            echo "::error::Family AI identifier or branding was found in the signed SchoolHop app."
+            exit 1
+          fi
+
+          if ! grep -R -a -q 'https://schoolhop.shourish.com' "$APP_PATH/public"; then
+            echo "::error::SchoolHop production API URL was not found in packaged web assets."
+            exit 1
+          fi
+
+          echo "Signed SchoolHop app has the expected bundle ID, APNs entitlement, URL scheme, location metadata, native plugin, and production API URL."
+
+      - name: Upload IPA to App Store Connect
+        if: ${{ inputs.upload_to_testflight }}
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          IPA_PATH=$(find "$EXPORT_PATH" -maxdepth 1 -name "*.ipa" -print -quit)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No IPA was produced at $EXPORT_PATH"
+            exit 1
+          fi
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            2>&1 | tee "$LOG_DIR/upload.log"
+          echo "SchoolHop IPA uploaded to App Store Connect for TestFlight processing."
+
+      - name: Upload archive, export, and upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schoolhop-testflight-build-logs
+          path: |
+            build/xcode-logs
+            build/ExportOptions.plist
+          if-no-files-found: ignore
+
+      - name: Upload signed IPA artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schoolhop-testflight-ipa
+          path: build/export/*.ipa
+          if-no-files-found: error
+
+      - name: Clean up signing materials
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          if [ -n "${PROFILE_UUID:-}" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          fi
+          if [ -n "${ASC_KEY_PATH:-}" ]; then
+            rm -f "$ASC_KEY_PATH"
+          fi
+          rm -rf "$RUNNER_TEMP/schoolhop-distribution.p12" "$RUNNER_TEMP/schoolhop-app-store.mobileprovision" "$RUNNER_TEMP/schoolhop-app-store-profile.plist" build/signing

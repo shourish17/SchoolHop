@@ -3,6 +3,7 @@
     "allowJs": true,
     "checkJs": false,
     "lib": ["ES2022", "DOM"],
+    "moduleResolution": "node",
     "noEmit": true,
     "target": "ES2022"
   },
