@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=23/);
-  assert.match(worker, /schoolhop-shell-v23/);
-  assert.match(worker, /\/static\/app\.js\?v=23/);
+  assert.match(html, /\/static\/app\.js\?v=24/);
+  assert.match(worker, /schoolhop-shell-v24/);
+  assert.match(worker, /\/static\/app\.js\?v=24/);
 });
 
 test("registration UI uses verified account creation flow", async () => {
@@ -80,6 +80,11 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   assert.match(app, /function renderTripMap/);
   assert.match(app, /function startLocationPolling/);
   assert.match(app, /\/api\/trips\/\$\{tripId\}\/location/);
+  assert.match(app, /\/api\/trips\/\$\{tripId\}\/route/);
+  assert.match(app, /ROUTE_REFRESH_MS = 30000/);
+  assert.match(app, /function etaSummaryHTML/);
+  assert.match(app, /ETA to School/);
+  assert.match(app, /ETA temporarily unavailable/);
   assert.match(app, /vehicle-marker/);
   assert.match(app, /const startedTrips = trips\.filter\(\(trip\) => trip\.status === "started"\)/);
   assert.match(html, /Current Trip/);
@@ -107,7 +112,20 @@ test("home screen orders pending actions, current trip, next trip, and upcoming 
   assert.match(app, /state\.pendingActions = pendingActions/);
   assert.match(app, /\$\("pendingActionPanel"\)\.classList\.toggle\("hidden", !state\.pendingActions\.length\)/);
   assert.match(app, /const currentTrip = startedTrips\[0\] \|\| null/);
+  assert.match(app, /const startedTrip = trips\.find\(\(trip\) => trip\.status === "started"\)/);
   assert.match(app, /const nextTrip = upcomingTrips\[0\] \|\| null/);
+});
+
+test("current trip cards render live ETA and unavailable states", async () => {
+  const app = await read("app/static/app.js");
+  const styles = await read("app/static/styles.css");
+
+  assert.match(app, /etaSummaryHTML\(trip\)/);
+  assert.match(app, /route && route\.eta_at && route\.duration_seconds != null/);
+  assert.match(app, /Waiting for driver's location\.\.\./);
+  assert.match(app, /if \(location && !location\.fresh\)/);
+  assert.match(app, /Last location update:/);
+  assert.match(styles, /\.eta-summary/);
 });
 
 test("home keeps trip rendering independent from non-critical refresh failures", async () => {

@@ -758,6 +758,16 @@ def route_waypoint_from_child(child: asyncpg.Record) -> dict[str, Any] | None:
     return None
 
 
+def parse_google_duration_seconds(duration: str | None) -> int | None:
+    if not duration or not duration.endswith("s"):
+        return None
+    try:
+        seconds = float(duration[:-1])
+    except ValueError:
+        return None
+    return max(0, int(round(seconds)))
+
+
 async def trip_route_children_for_user(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> tuple[list[asyncpg.Record], bool]:
     is_driver = trip["driver_user_id"] == UUID(str(user_id))
     creator = await database.fetchval("SELECT created_by FROM carpool_groups WHERE id = $1", trip["group_id"])
@@ -2519,9 +2529,17 @@ async def latest_location(trip_id: UUID, user: UserDep, database: DbDep) -> dict
 @app.get("/api/trips/{trip_id}/route")
 async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await trip_with_permission(database, user["id"], trip_id)
+    if trip["status"] != "started" or trip["ended_at"] is not None:
+        return {"route": None, "message": "Live ETA is available only during an active trip"}
     latest = await database.fetchrow("SELECT * FROM trip_locations WHERE trip_id = $1 ORDER BY received_at DESC LIMIT 1", trip_id)
     if not latest:
-        return {"route": None, "message": "GPS unavailable"}
+        return {"route": None, "message": "Waiting for driver's location..."}
+    age = (datetime.now(UTC) - latest["received_at"]).total_seconds()
+    if age > settings.location_stale_seconds:
+        return {
+            "route": None,
+            "message": f"ETA temporarily unavailable. Driver location is stale: last updated {int(age)} seconds ago",
+        }
     school = await database.fetchrow(
         """
         SELECT s.name, s.address, s.city, s.country
@@ -2541,33 +2559,6 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
     if not settings.google_routes_api_key:
         return {"route": None, "message": "Server-side Google Routes key is not configured"}
 
-    child_rows, full_trip_route = await trip_route_children_for_user(database, user["id"], trip)
-    if not child_rows:
-        return {"route": None, "message": "No child stops are visible for this trip."}
-    pending_status = "pickup_status" if trip["trip_type"] == "pickup" else "dropoff_status"
-    pending_child_rows = [child for child in child_rows if child[pending_status] == "pending"]
-    stops = []
-    missing_home = []
-    for child in pending_child_rows:
-        waypoint = route_waypoint_from_child(child)
-        if not waypoint:
-            missing_home.append(child["name"])
-            continue
-        stops.append({
-            "child_id": str(child["id"]),
-            "name": child["name"],
-            "address": child_home_address(child),
-            "waypoint": waypoint,
-        })
-    if missing_home:
-        return {"route": None, "message": f"Add home address for: {', '.join(missing_home)}"}
-    if trip["trip_type"] == "dropoff" and not stops:
-        return {"route": None, "message": "No pending drop-off stops."}
-    if trip["trip_type"] == "pickup" and not full_trip_route and not stops:
-        child_in_vehicle = any(child["pickup_status"] == "picked_up" for child in child_rows)
-        if not child_in_vehicle:
-            return {"route": None, "message": "No pending pickup stops."}
-
     request_body = {
         "origin": {
             "location": {
@@ -2582,23 +2573,35 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
         "computeAlternativeRoutes": False,
         "units": "METRIC",
     }
-    target_label = "school" if trip["trip_type"] == "pickup" else "last home stop"
-    route_destination = destination if trip["trip_type"] == "pickup" else stops[-1]["address"]
-    if trip["trip_type"] == "pickup" and full_trip_route:
+    stops = []
+    full_trip_route = trip["trip_type"] == "pickup"
+    target_label = "school"
+    route_destination = destination
+    if trip["trip_type"] == "pickup":
         request_body["destination"] = {"address": destination}
-        if stops:
-            request_body["intermediates"] = [stop["waypoint"] for stop in stops]
-    elif trip["trip_type"] == "pickup":
-        if stops:
-            request_body["destination"] = stops[-1]["waypoint"]
-            if len(stops) > 1:
-                request_body["intermediates"] = [stop["waypoint"] for stop in stops[:-1]]
-            target_label = "your pickup stop"
-            route_destination = stops[-1]["address"]
-        else:
-            request_body["destination"] = {"address": destination}
-            route_destination = destination
     else:
+        child_rows, full_trip_route = await trip_route_children_for_user(database, user["id"], trip)
+        if not child_rows:
+            return {"route": None, "message": "No child stops are visible for this trip."}
+        pending_child_rows = [child for child in child_rows if child["dropoff_status"] == "pending"]
+        missing_home = []
+        for child in pending_child_rows:
+            waypoint = route_waypoint_from_child(child)
+            if not waypoint:
+                missing_home.append(child["name"])
+                continue
+            stops.append({
+                "child_id": str(child["id"]),
+                "name": child["name"],
+                "address": child_home_address(child),
+                "waypoint": waypoint,
+            })
+        if missing_home:
+            return {"route": None, "message": f"Add home address for: {', '.join(missing_home)}"}
+        if not stops:
+            return {"route": None, "message": "No pending drop-off stops."}
+        target_label = "last home stop"
+        route_destination = stops[-1]["address"]
         request_body["destination"] = stops[-1]["waypoint"]
         if len(stops) > 1:
             request_body["intermediates"] = [stop["waypoint"] for stop in stops[:-1]]
@@ -2623,6 +2626,7 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
     if not routes:
         return {"route": None, "message": "No route found"}
     route = routes[0]
+    duration_seconds = parse_google_duration_seconds(route.get("duration"))
     return {
         "route": {
             "destination": route_destination,
@@ -2631,8 +2635,11 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
             "trip_type": trip["trip_type"],
             "stops": [{key: value for key, value in stop.items() if key != "waypoint"} for stop in stops],
             "duration": route.get("duration"),
+            "duration_seconds": duration_seconds,
+            "eta_at": (datetime.now(UTC) + timedelta(seconds=duration_seconds)).isoformat() if duration_seconds is not None else None,
             "distance_meters": route.get("distanceMeters"),
             "encoded_polyline": route.get("polyline", {}).get("encodedPolyline"),
+            "location_age_seconds": int(age),
         }
     }
 

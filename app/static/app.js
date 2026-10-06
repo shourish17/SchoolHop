@@ -25,6 +25,7 @@ const state = {
   locationPollId: null,
   locationPollTripId: null,
   locationPollInFlight: false,
+  routePollInFlight: false,
   lastLocationPostAt: 0,
   queuedLocationPost: null,
   locationPostTimer: null,
@@ -35,6 +36,7 @@ const state = {
   nativePushListenerRegistered: false,
 };
 
+const ROUTE_REFRESH_MS = 30000;
 let notificationAudioContext = null;
 let notificationAudioElement = null;
 
@@ -206,6 +208,66 @@ function mapLocation(trip) {
   const longitude = Number(location.longitude);
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
   return { ...location, latitude, longitude };
+}
+
+function formatClock(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatDuration(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return "";
+  const minutes = Math.max(1, Math.round(value / 60));
+  return `${minutes} min`;
+}
+
+function lastLocationLabel(trip) {
+  const location = trip && trip.latest_location;
+  if (!location || !location.received_at) return "";
+  return `Last location update: ${formatClock(location.received_at)}`;
+}
+
+function etaTitle(route) {
+  if (!route) return "ETA";
+  if (route.trip_type === "pickup") return "ETA to School";
+  if (route.scope === "your_child" && route.stops && route.stops.length) {
+    return `${route.stops[route.stops.length - 1].name} arriving`;
+  }
+  return "ETA to drop-off";
+}
+
+function etaSummaryHTML(trip) {
+  if (!trip || trip.status !== "started") return "";
+  const location = mapLocation(trip);
+  const route = trip.latest_route;
+  const lastLocation = lastLocationLabel(trip);
+  if (location && !location.fresh) {
+    return `
+      <div class="eta-summary muted">
+        <strong>ETA temporarily unavailable</strong>
+        ${lastLocation ? `<small>${escapeHTML(lastLocation)}</small>` : ""}
+      </div>`;
+  }
+  if (route && route.eta_at && route.duration_seconds != null) {
+    const duration = formatDuration(route.duration_seconds);
+    return `
+      <div class="eta-summary">
+        <strong>${escapeHTML(etaTitle(route))}</strong>
+        <span>${escapeHTML([formatClock(route.eta_at), duration].filter(Boolean).join(" · "))}</span>
+        ${lastLocation ? `<small>${escapeHTML(lastLocation)}</small>` : ""}
+      </div>`;
+  }
+  const message = !location
+    ? "Waiting for driver's location..."
+    : (!location.fresh ? "ETA temporarily unavailable" : (trip.route_message || "ETA temporarily unavailable"));
+  return `
+    <div class="eta-summary muted">
+      <strong>${escapeHTML(message)}</strong>
+      ${lastLocation ? `<small>${escapeHTML(lastLocation)}</small>` : ""}
+    </div>`;
 }
 
 async function init() {
@@ -550,6 +612,12 @@ async function refreshGroupContext() {
 
 function chooseSelectedTrip() {
   const trips = activeTrips();
+  const startedTrip = trips.find((trip) => trip.status === "started");
+  if (startedTrip && state.selectedTripId !== startedTrip.id) {
+    state.selectedTripId = startedTrip.id;
+    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+    return;
+  }
   if (state.selectedTripId && trips.some((trip) => trip.id === state.selectedTripId)) return;
   if (trips[0]) {
     state.selectedTripId = trips[0].id;
@@ -701,6 +769,7 @@ function tripCard(trip, selectable = true) {
         <div>${pill(trip.status, statusTone(trip.status))}${tracking ? pill("tracking on", "good") : ""}${response}</div>
       </div>
       <p>${escapeHTML(children || "No children visible.")}</p>
+      ${etaSummaryHTML(trip)}
       ${selectable ? `
         <div class="mini-actions">
           <button class="ghost choose-trip" data-trip="${escapeHTML(trip.id)}" type="button">${tracking ? "View map" : "Open"}</button>
@@ -842,7 +911,9 @@ function renderTripMap(trip) {
       </iframe>
       <div class="vehicle-marker" aria-label="Driver GPS point" title="Driver GPS point">CAR</div>
     </div>
-    <div class="route-summary">${escapeHTML(location.message || (location.fresh ? "GPS fresh" : "GPS location received"))}</div>`;
+    <div class="route-summary">
+      ${etaSummaryHTML(trip) || escapeHTML(location.message || (location.fresh ? "GPS fresh" : "GPS location received"))}
+    </div>`;
 }
 
 function renderChildren() {
@@ -1340,6 +1411,7 @@ function stopLocationPolling() {
   state.locationPollId = null;
   state.locationPollTripId = null;
   state.locationPollInFlight = false;
+  state.routePollInFlight = false;
 }
 
 async function fetchLatestLocation(tripId) {
@@ -1348,10 +1420,35 @@ async function fetchLatestLocation(tripId) {
   try {
     const data = await api(`/api/trips/${tripId}/location`);
     if (data && data.location) updateTripLocation(tripId, data.location, false);
+    const trip = state.trips.find((item) => item.id === tripId);
+    if (trip && shouldFetchRoute(trip)) await fetchTripRoute(tripId);
   } catch (error) {
     reportClientError(error, { source: "location-poll" });
   } finally {
     state.locationPollInFlight = false;
+  }
+}
+
+function shouldFetchRoute(trip) {
+  const location = mapLocation(trip);
+  if (!trip || trip.status !== "started" || !location || !location.fresh) return false;
+  return Date.now() >= Number(trip.next_route_refresh_at || 0);
+}
+
+async function fetchTripRoute(tripId, { force = false } = {}) {
+  const trip = state.trips.find((item) => item.id === tripId);
+  if (!trip || trip.status !== "started" || state.routePollInFlight) return;
+  if (!force && !shouldFetchRoute(trip)) return;
+  state.routePollInFlight = true;
+  trip.next_route_refresh_at = Date.now() + ROUTE_REFRESH_MS;
+  try {
+    const data = await api(`/api/trips/${tripId}/route`);
+    updateTripRoute(tripId, data);
+  } catch (error) {
+    updateTripRoute(tripId, { route: null, message: "ETA temporarily unavailable" });
+    reportClientError(error, { source: "route-poll" });
+  } finally {
+    state.routePollInFlight = false;
   }
 }
 
@@ -1419,6 +1516,7 @@ async function sendPositionNow(tripId, position) {
       }),
     });
     updateTripLocation(tripId, location);
+    await fetchTripRoute(tripId, { force: true });
   } finally {
     state.locationPostInFlight = false;
     if (state.queuedLocationPost && state.locationPostTimer === null) queueLatestPosition(state.queuedLocationPost.tripId, state.queuedLocationPost.position);
@@ -1434,6 +1532,16 @@ function updateTripLocation(tripId, location, justUpdated = true) {
     message: justUpdated ? "GPS just updated" : location.message,
   };
   if (selectedTrip() && selectedTrip().id === tripId) renderTripConsole();
+  renderHome();
+}
+
+function updateTripRoute(tripId, data) {
+  const trip = state.trips.find((item) => item.id === tripId);
+  if (!trip) return;
+  trip.latest_route = data && data.route ? data.route : null;
+  trip.route_message = data && data.message ? data.message : null;
+  if (selectedTrip() && selectedTrip().id === tripId) renderTripConsole();
+  renderHome();
 }
 
 async function onHandoverClick(event) {

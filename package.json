@@ -1,6 +1,6 @@
 {
   "name": "schoolhop-pwa",
-  "version": "0.1.0",
+  "version": "1.0.24",
   "private": true,
   "description": "SchoolHop browser PWA static frontend checks.",
   "scripts": {

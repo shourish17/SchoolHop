@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date, timedelta, time
+from datetime import UTC, date, datetime, timedelta, time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -26,6 +26,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.original_smtp_host = main.settings.smtp_host
         self.original_smtp_from_email = main.settings.smtp_from_email
         self.original_smtp_use_tls = main.settings.smtp_use_tls
+        self.original_google_routes_api_key = main.settings.google_routes_api_key
+        self.original_location_stale_seconds = main.settings.location_stale_seconds
 
     def tearDown(self) -> None:
         main.settings.environment = self.original_environment
@@ -36,6 +38,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         main.settings.smtp_host = self.original_smtp_host
         main.settings.smtp_from_email = self.original_smtp_from_email
         main.settings.smtp_use_tls = self.original_smtp_use_tls
+        main.settings.google_routes_api_key = self.original_google_routes_api_key
+        main.settings.location_stale_seconds = self.original_location_stale_seconds
 
     async def test_production_register_endpoint_requires_verified_flow(self):
         main.settings.environment = "production"
@@ -143,6 +147,90 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sum("FROM users WHERE id = ANY" in query for query in database.fetch_queries), 1)
         self.assertEqual(sum("FROM trip_locations" in query for query in database.fetch_queries), 1)
+
+    async def test_route_eta_unavailable_before_trip_starts(self):
+        ids = ActionIds()
+        database = RouteDatabase(ids, status="planned")
+
+        result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertIsNone(result["route"])
+        self.assertEqual(result["message"], "Live ETA is available only during an active trip")
+
+    async def test_route_eta_available_after_start_with_driver_gps(self):
+        ids = ActionIds()
+        main.settings.google_routes_api_key = "routes-key"
+        database = RouteDatabase(ids, trip_type="pickup")
+        response = MagicMock()
+        response.json.return_value = {"routes": [{"duration": "720s", "distanceMeters": 3200}]}
+        client = AsyncMock()
+        client.post.return_value = response
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertEqual(result["route"]["target_label"], "school")
+        self.assertEqual(result["route"]["duration_seconds"], 720)
+        self.assertIsNotNone(result["route"]["eta_at"])
+        request_body = client.post.await_args.kwargs["json"]
+        self.assertEqual(request_body["destination"], {"address": "1 School St, Berlin, DE"})
+
+    async def test_route_eta_uses_parent_child_home_destination_for_dropoff(self):
+        ids = ActionIds()
+        main.settings.google_routes_api_key = "routes-key"
+        database = RouteDatabase(ids, trip_type="dropoff")
+        response = MagicMock()
+        response.json.return_value = {"routes": [{"duration": "420s", "distanceMeters": 1500}]}
+        client = AsyncMock()
+        client.post.return_value = response
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertEqual(result["route"]["scope"], "your_child")
+        self.assertEqual(result["route"]["target_label"], "your drop-off stop")
+        self.assertEqual(result["route"]["stops"], [{"child_id": str(ids.child_id), "name": "Child", "address": "1 Home St, Berlin, DE"}])
+        request_body = client.post.await_args.kwargs["json"]
+        self.assertEqual(request_body["destination"], {"address": "1 Home St, Berlin, DE"})
+
+    async def test_route_eta_rejects_unauthorized_user(self):
+        ids = ActionIds()
+        database = RouteDatabase(ids, parent_allowed=False)
+
+        with self.assertRaises(HTTPException) as raised:
+            await main.trip_route(ids.trip_id, {"id": str(ids.unrelated_id)}, database)
+
+        self.assertEqual(raised.exception.status_code, 403)
+
+    async def test_route_eta_unavailable_when_driver_gps_missing_or_stale(self):
+        ids = ActionIds()
+        database = RouteDatabase(ids, latest_location=None)
+
+        missing = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertIsNone(missing["route"])
+        self.assertEqual(missing["message"], "Waiting for driver's location...")
+
+        main.settings.location_stale_seconds = 90
+        stale_database = RouteDatabase(ids, latest_location_received_at=datetime.now(UTC) - timedelta(minutes=5))
+
+        stale = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, stale_database)
+
+        self.assertIsNone(stale["route"])
+        self.assertIn("ETA temporarily unavailable", stale["message"])
+
+    async def test_completed_trip_does_not_return_live_eta(self):
+        ids = ActionIds()
+        database = RouteDatabase(ids, status="completed", ended_at=datetime.now(UTC))
+
+        result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertIsNone(result["route"])
+        self.assertEqual(result["message"], "Live ETA is available only during an active trip")
 
     async def test_driver_10_minute_delay_notifies_only_affected_recipients(self):
         ids = ActionIds()
@@ -702,6 +790,99 @@ class AsyncContext:
 
     async def __aexit__(self, *_):
         return None
+
+
+class RouteDatabase:
+    def __init__(
+        self,
+        ids: ActionIds,
+        *,
+        status="started",
+        trip_type="pickup",
+        ended_at=None,
+        parent_allowed=True,
+        latest_location=True,
+        latest_location_received_at=None,
+    ):
+        self.ids = ids
+        self.parent_allowed = parent_allowed
+        self.trip = Record(
+            {
+                "id": ids.trip_id,
+                "group_id": ids.group_id,
+                "driver_user_id": ids.driver_id,
+                "service_date": date.today(),
+                "trip_type": trip_type,
+                "expected_time": time(8, 0),
+                "status": status,
+                "delay_minutes": 0,
+                "delay_note": None,
+                "cancellation_reason": None,
+                "started_at": datetime.now(UTC) if status == "started" else None,
+                "ended_at": ended_at,
+                "safety_timeout_at": None,
+                "created_by": ids.organiser_id,
+                "created_at": None,
+            }
+        )
+        if latest_location is None:
+            self.latest_location = None
+        else:
+            self.latest_location = Record(
+                {
+                    "id": uuid4(),
+                    "trip_id": ids.trip_id,
+                    "driver_user_id": ids.driver_id,
+                    "latitude": 52.52,
+                    "longitude": 13.405,
+                    "accuracy_meters": 12,
+                    "speed_mps": None,
+                    "heading_degrees": None,
+                    "recorded_at": datetime.now(UTC),
+                    "received_at": latest_location_received_at or datetime.now(UTC),
+                }
+            )
+
+    async def fetchrow(self, query, *args):
+        if "SELECT * FROM trips WHERE id" in query:
+            return self.trip
+        if "FROM group_members" in query:
+            return Record({"group_id": self.ids.group_id, "user_id": args[1], "role": "member", "status": "active"})
+        if "FROM trip_locations" in query:
+            return self.latest_location
+        if "FROM carpool_groups cg" in query and "JOIN schools" in query:
+            return Record({"name": "School", "address": "1 School St", "city": "Berlin", "country": "DE"})
+        raise AssertionError(query)
+
+    async def fetchval(self, query, *args):
+        if "SELECT created_by FROM carpool_groups" in query:
+            return self.ids.organiser_id
+        if "FROM trip_children tc" in query and "c.parent_id" in query:
+            return 1 if self.parent_allowed and args[1] == self.ids.parent_id else None
+        if "FROM roster_change_requests" in query:
+            return None
+        raise AssertionError(query)
+
+    async def fetch(self, query, *args):
+        if "FROM trip_children tc" in query and "JOIN children" in query:
+            if len(args) > 1 and args[1] != self.ids.parent_id:
+                return []
+            return [
+                Record(
+                    {
+                        "id": self.ids.child_id,
+                        "name": "Child",
+                        "home_address": "1 Home St",
+                        "home_city": "Berlin",
+                        "home_country": "DE",
+                        "home_latitude": None,
+                        "home_longitude": None,
+                        "pickup_status": "pending",
+                        "dropoff_status": "pending",
+                    }
+                )
+            ]
+        raise AssertionError(query)
 
 
 class PendingActionsDatabase:

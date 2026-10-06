@@ -403,6 +403,24 @@ fieldset input, .check input { width: auto; min-height: auto; accent-color: var(
   color: var(--ink);
   font-weight: 750;
 }
+.eta-summary {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 3px;
+}
+.eta-summary span {
+  color: var(--ink);
+  font-weight: 800;
+}
+.eta-summary small {
+  color: var(--muted);
+  font-weight: 650;
+}
+.eta-summary.muted strong {
+  color: var(--muted);
+}
 
 #toast {
   position: fixed;
