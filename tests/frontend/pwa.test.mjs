@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=24/);
-  assert.match(worker, /schoolhop-shell-v24/);
-  assert.match(worker, /\/static\/app\.js\?v=24/);
+  assert.match(html, /\/static\/app\.js\?v=25/);
+  assert.match(worker, /schoolhop-shell-v25/);
+  assert.match(worker, /\/static\/app\.js\?v=25/);
 });
 
 test("registration UI uses verified account creation flow", async () => {
@@ -122,10 +122,24 @@ test("current trip cards render live ETA and unavailable states", async () => {
 
   assert.match(app, /etaSummaryHTML\(trip\)/);
   assert.match(app, /route && route\.eta_at && route\.duration_seconds != null/);
+  assert.match(app, /formatDistance\(route\.distance_meters\)/);
+  assert.match(app, /m away/);
+  assert.match(app, /km away/);
   assert.match(app, /Waiting for driver's location\.\.\./);
-  assert.match(app, /if \(location && !location\.fresh\)/);
+  assert.match(app, /Waiting for updated driver location\.\.\./);
+  assert.match(app, /Destination unavailable/);
+  assert.match(app, /routeStatusMessage\(trip\.route_reason/);
   assert.match(app, /Last location update:/);
   assert.match(styles, /\.eta-summary/);
+});
+
+test("route polling asks backend even when local GPS freshness is stale", async () => {
+  const app = await read("app/static/app.js");
+
+  assert.match(app, /function shouldFetchRoute\(trip\)/);
+  assert.match(app, /if \(!trip \|\| trip\.status !== "started"\) return false/);
+  assert.doesNotMatch(app, /!location \|\| !location\.fresh/);
+  assert.match(app, /trip\.route_reason = data && data\.reason \? data\.reason : null/);
 });
 
 test("home keeps trip rendering independent from non-critical refresh failures", async () => {
@@ -203,4 +217,24 @@ test("automatic GPS updates are throttled with latest trailing position", async 
   assert.match(app, /flushQueuedPosition/);
   assert.match(app, /postPosition\(trip\.id, position, \{ force: true \}\)/);
   assert.match(app, /state\.locationPostInFlight \|\| now - state\.lastLocationPostAt < 4000/);
+});
+
+test("iOS native location bridge uses background location only for active native tracking", async () => {
+  const swift = await read("ios/App/App/SchoolHopLocationPlugin.swift");
+  const plist = await read("ios/App/App/Info.plist");
+
+  assert.match(plist, /<string>location<\/string>/);
+  assert.match(swift, /requestAlwaysAuthorization\(\)/);
+  assert.match(swift, /allowsBackgroundLocationUpdates = locationManager\.authorizationStatus == \.authorizedAlways/);
+  assert.match(swift, /distanceFilter = 25/);
+  assert.match(swift, /Date\(\)\.timeIntervalSince\(lastPostAt\) >= 4/);
+  assert.match(swift, /stopUpdatingLocation\(\)/);
+  assert.match(swift, /stopMonitoringSignificantLocationChanges\(\)/);
+});
+
+test("trip completion clears active GPS tracking in the PWA state", async () => {
+  const app = await read("app/static/app.js");
+
+  assert.match(app, /if \(state\.trackingTripId === updatedTrip\.id\) stopTracking\(\)/);
+  assert.match(app, /const ended = await api\(`\/api\/trips\/\$\{trip\.id\}\/end`/);
 });

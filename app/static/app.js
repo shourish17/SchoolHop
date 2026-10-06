@@ -224,6 +224,21 @@ function formatDuration(seconds) {
   return `${minutes} min`;
 }
 
+function formatDistance(meters) {
+  const value = Number(meters);
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value < 1000) return `${Math.round(value)} m away`;
+  return `${(value / 1000).toFixed(1)} km away`;
+}
+
+function routeStatusMessage(reason, fallback) {
+  if (reason === "location_missing") return "Waiting for driver's location...";
+  if (reason === "location_stale") return "Waiting for updated driver location...";
+  if (reason === "destination_missing") return "Destination unavailable";
+  if (reason === "trip_not_active") return "Live ETA is available only during an active trip";
+  return fallback || "ETA temporarily unavailable";
+}
+
 function lastLocationLabel(trip) {
   const location = trip && trip.latest_location;
   if (!location || !location.received_at) return "";
@@ -244,25 +259,18 @@ function etaSummaryHTML(trip) {
   const location = mapLocation(trip);
   const route = trip.latest_route;
   const lastLocation = lastLocationLabel(trip);
-  if (location && !location.fresh) {
-    return `
-      <div class="eta-summary muted">
-        <strong>ETA temporarily unavailable</strong>
-        ${lastLocation ? `<small>${escapeHTML(lastLocation)}</small>` : ""}
-      </div>`;
-  }
   if (route && route.eta_at && route.duration_seconds != null) {
     const duration = formatDuration(route.duration_seconds);
+    const distance = formatDistance(route.distance_meters);
     return `
       <div class="eta-summary">
         <strong>${escapeHTML(etaTitle(route))}</strong>
         <span>${escapeHTML([formatClock(route.eta_at), duration].filter(Boolean).join(" · "))}</span>
+        ${distance ? `<small>${escapeHTML(distance)}</small>` : ""}
         ${lastLocation ? `<small>${escapeHTML(lastLocation)}</small>` : ""}
       </div>`;
   }
-  const message = !location
-    ? "Waiting for driver's location..."
-    : (!location.fresh ? "ETA temporarily unavailable" : (trip.route_message || "ETA temporarily unavailable"));
+  const message = routeStatusMessage(trip.route_reason, !location ? "Waiting for driver's location..." : trip.route_message);
   return `
     <div class="eta-summary muted">
       <strong>${escapeHTML(message)}</strong>
@@ -1148,6 +1156,7 @@ function updateTripInState(updatedTrip) {
     state.trips.sort((a, b) => `${a.service_date} ${a.expected_time}`.localeCompare(`${b.service_date} ${b.expected_time}`));
   }
   if (isArchivedTrip(updatedTrip)) {
+    if (state.trackingTripId === updatedTrip.id) stopTracking();
     state.trips = state.trips.filter((trip) => trip.id !== updatedTrip.id);
     if (state.selectedTripId === updatedTrip.id) {
       state.selectedTripId = null;
@@ -1430,8 +1439,7 @@ async function fetchLatestLocation(tripId) {
 }
 
 function shouldFetchRoute(trip) {
-  const location = mapLocation(trip);
-  if (!trip || trip.status !== "started" || !location || !location.fresh) return false;
+  if (!trip || trip.status !== "started") return false;
   return Date.now() >= Number(trip.next_route_refresh_at || 0);
 }
 
@@ -1540,6 +1548,7 @@ function updateTripRoute(tripId, data) {
   if (!trip) return;
   trip.latest_route = data && data.route ? data.route : null;
   trip.route_message = data && data.message ? data.message : null;
+  trip.route_reason = data && data.reason ? data.reason : null;
   if (selectedTrip() && selectedTrip().id === tripId) renderTripConsole();
   renderHome();
 }

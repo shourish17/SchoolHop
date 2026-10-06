@@ -7,9 +7,11 @@ SchoolHop's API accepts and authorizes live GPS updates only while a trip is act
 - `GET /api/trips/{trip_id}/location`
 - `POST /api/trips/{trip_id}/end`
 
-The web UI includes a manual foreground browser GPS sender for local MVP testing only. A normal website or PWA should not be treated as reliable locked-screen tracking.
+The web UI includes foreground browser GPS tracking for local MVP testing and PWA pilots. A normal website or PWA should not be treated as reliable locked-screen tracking: iOS can suspend JavaScript timers, `watchPosition`, and network posts when Safari or the installed PWA is backgrounded, the screen locks, battery saver intervenes, or permission changes. While the page remains foregrounded, SchoolHop throttles posted fixes to roughly every four seconds and keeps the latest trailing position.
 
-For production driver tracking, build native iOS/Android shells or a cross-platform app using platform background-location APIs. The native app must:
+For production driver tracking, use native iOS/Android shells or a cross-platform app using platform background-location APIs. The iOS Capacitor shell in `ios/App` has `UIBackgroundModes=location`, requests Always permission only after a driver starts an active trip, sets `allowsBackgroundLocationUpdates` only when Always permission is granted, disables automatic pauses, and uses a 25 m distance filter plus a four-second post throttle. If the installed TestFlight build does not contain those plist/plugin settings, or the driver grants only When In Use, locked-screen tracking will remain unreliable until a new native build is approved and installed.
+
+The native app must:
 
 - request OS background location permission only for drivers who start an assigned trip;
 - start location collection after the trip transitions to `started`;

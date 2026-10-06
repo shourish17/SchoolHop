@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     cors_origins: str = "http://localhost:8088,http://127.0.0.1:8088"
     raw_location_retention_minutes: int = 120
-    location_stale_seconds: int = 90
+    location_stale_seconds: int = 240
     safety_timeout_minutes: int = 180
     fcm_server_key: str | None = None
     apns_key_id: str | None = None
@@ -766,6 +766,39 @@ def parse_google_duration_seconds(duration: str | None) -> int | None:
     except ValueError:
         return None
     return max(0, int(round(seconds)))
+
+
+def parse_google_distance_meters(distance: Any) -> int | None:
+    try:
+        meters = int(distance)
+    except (TypeError, ValueError):
+        return None
+    return meters if meters >= 0 else None
+
+
+def route_unavailable(reason: str, message: str, **diagnostics: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"route": None, "reason": reason, "message": message}
+    if diagnostics:
+        payload["diagnostics"] = diagnostics
+    return payload
+
+
+def safe_google_error(response: httpx.Response | None) -> dict[str, Any]:
+    if response is None:
+        return {}
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    if error.get("status"):
+        safe["status"] = error.get("status")
+    if error.get("code"):
+        safe["code"] = error.get("code")
+    return safe
 
 
 async def trip_route_children_for_user(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> tuple[list[asyncpg.Record], bool]:
@@ -2530,16 +2563,17 @@ async def latest_location(trip_id: UUID, user: UserDep, database: DbDep) -> dict
 async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await trip_with_permission(database, user["id"], trip_id)
     if trip["status"] != "started" or trip["ended_at"] is not None:
-        return {"route": None, "message": "Live ETA is available only during an active trip"}
+        return route_unavailable("trip_not_active", "Live ETA is available only during an active trip")
     latest = await database.fetchrow("SELECT * FROM trip_locations WHERE trip_id = $1 ORDER BY received_at DESC LIMIT 1", trip_id)
     if not latest:
-        return {"route": None, "message": "Waiting for driver's location..."}
+        return route_unavailable("location_missing", "Waiting for driver's location...")
     age = (datetime.now(UTC) - latest["received_at"]).total_seconds()
     if age > settings.location_stale_seconds:
-        return {
-            "route": None,
-            "message": f"ETA temporarily unavailable. Driver location is stale: last updated {int(age)} seconds ago",
-        }
+        return route_unavailable(
+            "location_stale",
+            "Waiting for updated driver location...",
+            location_age_seconds=int(age),
+        )
     school = await database.fetchrow(
         """
         SELECT s.name, s.address, s.city, s.country
@@ -2550,14 +2584,15 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
         trip["group_id"],
     )
     if not school:
-        return {"route": None, "message": "School destination unavailable"}
+        return route_unavailable("destination_missing", "Destination unavailable")
     destination = ", ".join(
         part for part in [school["address"], school["city"], school["country"]] if part
     ) or ", ".join(part for part in [school["name"], school["city"], school["country"]] if part)
     if not destination and trip["trip_type"] == "pickup":
-        return {"route": None, "message": "Add a school address to enable route and ETA"}
+        return route_unavailable("destination_missing", "Destination unavailable")
     if not settings.google_routes_api_key:
-        return {"route": None, "message": "Server-side Google Routes key is not configured"}
+        logger.warning("route compute unavailable", extra={"trip_id": str(trip_id), "reason": "routing_unavailable", "google_status": None})
+        return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
 
     request_body = {
         "origin": {
@@ -2582,7 +2617,7 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
     else:
         child_rows, full_trip_route = await trip_route_children_for_user(database, user["id"], trip)
         if not child_rows:
-            return {"route": None, "message": "No child stops are visible for this trip."}
+            return route_unavailable("destination_missing", "Destination unavailable")
         pending_child_rows = [child for child in child_rows if child["dropoff_status"] == "pending"]
         missing_home = []
         for child in pending_child_rows:
@@ -2597,9 +2632,9 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
                 "waypoint": waypoint,
             })
         if missing_home:
-            return {"route": None, "message": f"Add home address for: {', '.join(missing_home)}"}
+            return route_unavailable("destination_missing", "Destination unavailable")
         if not stops:
-            return {"route": None, "message": "No pending drop-off stops."}
+            return route_unavailable("trip_not_active", "Live ETA is available only during an active trip")
         target_label = "last home stop"
         route_destination = stops[-1]["address"]
         request_body["destination"] = stops[-1]["waypoint"]
@@ -2620,13 +2655,52 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
             )
             response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Route provider unavailable") from exc
+        response = getattr(exc, "response", None)
+        google_error = safe_google_error(response)
+        logger.warning(
+            "route compute failed",
+            extra={
+                "trip_id": str(trip_id),
+                "reason": "routing_unavailable",
+                "google_http_status": getattr(response, "status_code", None),
+                "google_error_status": google_error.get("status"),
+                "google_error_code": google_error.get("code"),
+            },
+        )
+        return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
 
     routes = response.json().get("routes", [])
     if not routes:
-        return {"route": None, "message": "No route found"}
+        logger.warning(
+            "route compute returned no routes",
+            extra={"trip_id": str(trip_id), "reason": "routing_unavailable", "google_http_status": getattr(response, "status_code", None)},
+        )
+        return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
     route = routes[0]
     duration_seconds = parse_google_duration_seconds(route.get("duration"))
+    distance_meters = parse_google_distance_meters(route.get("distanceMeters"))
+    if duration_seconds is None or distance_meters is None:
+        logger.warning(
+            "route compute missing required fields",
+            extra={
+                "trip_id": str(trip_id),
+                "reason": "routing_unavailable",
+                "google_http_status": getattr(response, "status_code", None),
+                "has_duration": duration_seconds is not None,
+                "has_distance_meters": distance_meters is not None,
+            },
+        )
+        return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
+    logger.info(
+        "route compute succeeded",
+        extra={
+            "trip_id": str(trip_id),
+            "reason": None,
+            "google_http_status": getattr(response, "status_code", None),
+            "has_duration": True,
+            "has_distance_meters": True,
+        },
+    )
     return {
         "route": {
             "destination": route_destination,
@@ -2636,8 +2710,8 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
             "stops": [{key: value for key, value in stop.items() if key != "waypoint"} for stop in stops],
             "duration": route.get("duration"),
             "duration_seconds": duration_seconds,
-            "eta_at": (datetime.now(UTC) + timedelta(seconds=duration_seconds)).isoformat() if duration_seconds is not None else None,
-            "distance_meters": route.get("distanceMeters"),
+            "eta_at": (datetime.now(UTC) + timedelta(seconds=duration_seconds)).isoformat(),
+            "distance_meters": distance_meters,
             "encoded_polyline": route.get("polyline", {}).get("encodedPolyline"),
             "location_age_seconds": int(age),
         }

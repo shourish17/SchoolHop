@@ -173,6 +173,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["route"]["target_label"], "school")
         self.assertEqual(result["route"]["duration_seconds"], 720)
+        self.assertEqual(result["route"]["distance_meters"], 3200)
         self.assertIsNotNone(result["route"]["eta_at"])
         request_body = client.post.await_args.kwargs["json"]
         self.assertEqual(request_body["destination"], {"address": "1 School St, Berlin, DE"})
@@ -193,6 +194,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["route"]["scope"], "your_child")
         self.assertEqual(result["route"]["target_label"], "your drop-off stop")
+        self.assertEqual(result["route"]["distance_meters"], 1500)
         self.assertEqual(result["route"]["stops"], [{"child_id": str(ids.child_id), "name": "Child", "address": "1 Home St, Berlin, DE"}])
         request_body = client.post.await_args.kwargs["json"]
         self.assertEqual(request_body["destination"], {"address": "1 Home St, Berlin, DE"})
@@ -213,15 +215,27 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         missing = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
 
         self.assertIsNone(missing["route"])
+        self.assertEqual(missing["reason"], "location_missing")
         self.assertEqual(missing["message"], "Waiting for driver's location...")
 
-        main.settings.location_stale_seconds = 90
+        main.settings.location_stale_seconds = 240
         stale_database = RouteDatabase(ids, latest_location_received_at=datetime.now(UTC) - timedelta(minutes=5))
 
         stale = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, stale_database)
 
         self.assertIsNone(stale["route"])
-        self.assertIn("ETA temporarily unavailable", stale["message"])
+        self.assertEqual(stale["reason"], "location_stale")
+        self.assertEqual(stale["message"], "Waiting for updated driver location...")
+
+    async def test_route_eta_unavailable_when_destination_missing(self):
+        ids = ActionIds()
+        database = RouteDatabase(ids, school=None)
+
+        result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertIsNone(result["route"])
+        self.assertEqual(result["reason"], "destination_missing")
+        self.assertEqual(result["message"], "Destination unavailable")
 
     async def test_completed_trip_does_not_return_live_eta(self):
         ids = ActionIds()
@@ -230,7 +244,42 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
 
         self.assertIsNone(result["route"])
+        self.assertEqual(result["reason"], "trip_not_active")
         self.assertEqual(result["message"], "Live ETA is available only during an active trip")
+
+    async def test_route_eta_returns_routing_unavailable_on_google_failure(self):
+        ids = ActionIds()
+        main.settings.google_routes_api_key = "routes-key"
+        database = RouteDatabase(ids, trip_type="pickup")
+        response = http_response(503, {"error": {"status": "UNAVAILABLE", "code": 503, "message": "provider detail"}})
+        client = AsyncMock()
+        client.post.side_effect = main.httpx.HTTPStatusError("provider failed", request=MagicMock(), response=response)
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertIsNone(result["route"])
+        self.assertEqual(result["reason"], "routing_unavailable")
+        self.assertEqual(result["message"], "ETA temporarily unavailable")
+
+    async def test_route_eta_requires_duration_and_distance(self):
+        ids = ActionIds()
+        main.settings.google_routes_api_key = "routes-key"
+        database = RouteDatabase(ids, trip_type="pickup")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"routes": [{"duration": "720s"}]}
+        client = AsyncMock()
+        client.post.return_value = response
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertIsNone(result["route"])
+        self.assertEqual(result["reason"], "routing_unavailable")
 
     async def test_driver_10_minute_delay_notifies_only_affected_recipients(self):
         ids = ActionIds()
@@ -792,6 +841,12 @@ class AsyncContext:
         return None
 
 
+def http_response(status_code, payload):
+    response = MagicMock(status_code=status_code)
+    response.json.return_value = payload
+    return response
+
+
 class RouteDatabase:
     def __init__(
         self,
@@ -803,9 +858,11 @@ class RouteDatabase:
         parent_allowed=True,
         latest_location=True,
         latest_location_received_at=None,
+        school=True,
     ):
         self.ids = ids
         self.parent_allowed = parent_allowed
+        self.school = school
         self.trip = Record(
             {
                 "id": ids.trip_id,
@@ -851,6 +908,8 @@ class RouteDatabase:
         if "FROM trip_locations" in query:
             return self.latest_location
         if "FROM carpool_groups cg" in query and "JOIN schools" in query:
+            if self.school is None:
+                return None
             return Record({"name": "School", "address": "1 School St", "city": "Berlin", "country": "DE"})
         raise AssertionError(query)
 

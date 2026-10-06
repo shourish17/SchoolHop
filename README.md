@@ -39,7 +39,7 @@ Sample logins:
 - `JWT_SECRET`: signing secret for bearer tokens. Replace for every environment.
 - `CORS_ORIGINS`: comma-separated allowed browser origins.
 - `RAW_LOCATION_RETENTION_MINUTES`: short retention period for raw GPS updates. Default: 120.
-- `LOCATION_STALE_SECONDS`: age after which GPS is flagged stale. Default: 90.
+- `LOCATION_STALE_SECONDS`: age after which GPS is flagged stale. Default: 240.
 - `SAFETY_TIMEOUT_MINUTES`: maximum active trip sharing window. Default: 180.
 - `ENVIRONMENT`, `EXPOSE_DEVELOPMENT_VERIFICATION_CODES`: allow local/test-only exposure of verification codes when email is not configured.
 - `EMAIL_PROVIDER=agentmail`, `AGENTMAIL_API_KEY`, `AGENTMAIL_FROM_EMAIL`: AgentMail delivery for account/security email only, including email verification and forgot/reset password.
@@ -104,7 +104,7 @@ The PWA uses browser geolocation only after an assigned driver explicitly starts
 
 Do not present this PWA phase as Uber-style continuous tracking. iOS and Android browsers may pause JavaScript timers and geolocation when the phone is locked, the browser is backgrounded, battery saver is enabled, or permission is revoked. Reliable locked-screen tracking remains a later native app phase. See `mobile/background-location-notes.md` and the untouched `mobile/schoolhop-mobile` React Native prototype.
 
-The API accepts driver location only during an active trip, exposes latest trip location only to authorized parents/drivers, reports freshness, stops after trip end or safety timeout, and keeps raw updates only for the explicit short retention period.
+The API accepts driver location only during an active trip, exposes latest trip location only to authorized parents/drivers, reports freshness, stops after trip end or safety timeout, and keeps raw updates only for the explicit short retention period. The current stale threshold is four minutes: long enough to tolerate normal mobile GPS gaps and brief browser suspension, but short enough to avoid presenting a substantially old position as live.
 
 ## PWA Setup
 
