@@ -743,15 +743,9 @@ def child_home_address(child: asyncpg.Record | dict[str, Any]) -> str:
 
 
 def route_waypoint_from_child(child: asyncpg.Record) -> dict[str, Any] | None:
-    if child["home_latitude"] is not None and child["home_longitude"] is not None:
-        return {
-            "location": {
-                "latLng": {
-                    "latitude": float(child["home_latitude"]),
-                    "longitude": float(child["home_longitude"]),
-                }
-            }
-        }
+    waypoint = google_lat_lng_waypoint(child["home_latitude"], child["home_longitude"])
+    if waypoint:
+        return waypoint
     address = child_home_address(child)
     if address:
         return {"address": address}
@@ -774,6 +768,28 @@ def parse_google_distance_meters(distance: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return meters if meters >= 0 else None
+
+
+def valid_lat_lng(latitude: Any, longitude: Any) -> bool:
+    try:
+        lat = float(latitude)
+        lng = float(longitude)
+    except (TypeError, ValueError):
+        return False
+    return -90 <= lat <= 90 and -180 <= lng <= 180
+
+
+def google_lat_lng_waypoint(latitude: Any, longitude: Any) -> dict[str, Any] | None:
+    if not valid_lat_lng(latitude, longitude):
+        return None
+    return {
+        "location": {
+            "latLng": {
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+            }
+        }
+    }
 
 
 def route_unavailable(reason: str, message: str, **diagnostics: Any) -> dict[str, Any]:
@@ -801,7 +817,7 @@ def safe_google_error(response: httpx.Response | None) -> dict[str, Any]:
     return safe
 
 
-async def trip_route_children_for_user(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> tuple[list[asyncpg.Record], bool]:
+async def trip_route_context(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> tuple[list[asyncpg.Record], set[UUID], bool]:
     is_driver = trip["driver_user_id"] == UUID(str(user_id))
     creator = await database.fetchval("SELECT created_by FROM carpool_groups WHERE id = $1", trip["group_id"])
     proposed_swap = await database.fetchval(
@@ -817,32 +833,163 @@ async def trip_route_children_for_user(database: asyncpg.Pool, user_id: UUID | s
         UUID(str(user_id)),
     )
     can_view_all_stops = is_driver or creator == UUID(str(user_id)) or bool(proposed_swap)
-    if can_view_all_stops:
-        rows = await database.fetch(
-            """
-            SELECT c.id, c.name, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude,
-                   tc.pickup_status, tc.dropoff_status
-            FROM trip_children tc
-            JOIN children c ON c.id = tc.child_id
-            WHERE tc.trip_id = $1
-            ORDER BY c.name
-            """,
-            trip["id"],
+    rows = await database.fetch(
+        """
+        SELECT c.id, c.name, c.parent_id, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude,
+               tc.pickup_status, tc.dropoff_status
+        FROM trip_children tc
+        JOIN children c ON c.id = tc.child_id
+        WHERE tc.trip_id = $1
+        ORDER BY c.name
+        """,
+        trip["id"],
+    )
+    authorized_child_ids = {row["id"] for row in rows if row["parent_id"] == UUID(str(user_id))}
+    return list(rows), authorized_child_ids, can_view_all_stops
+
+
+def route_stop_from_child(child: asyncpg.Record) -> dict[str, Any] | None:
+    waypoint = route_waypoint_from_child(child)
+    if not waypoint:
+        return None
+    return {
+        "kind": "child_home",
+        "child_id": str(child["id"]),
+        "name": child["name"],
+        "address": child_home_address(child),
+        "waypoint": waypoint,
+    }
+
+
+def sanitize_route_stop(stop: dict[str, Any], *, include_private_destination: bool = False) -> dict[str, Any]:
+    public = {key: value for key, value in stop.items() if key not in {"waypoint", "address"}}
+    if include_private_destination and stop.get("address"):
+        public["address"] = stop["address"]
+    return public
+
+
+def route_ordered_intermediates(stops: list[dict[str, Any]], optimized_indexes: list[Any] | None) -> list[dict[str, Any]]:
+    if not stops or not optimized_indexes:
+        return stops
+    try:
+        indexes = [int(index) for index in optimized_indexes]
+    except (TypeError, ValueError):
+        return stops
+    if sorted(indexes) != list(range(len(stops))):
+        return stops
+    return [stops[index] for index in indexes]
+
+
+def route_leg_totals(legs: list[dict[str, Any]], stop_count: int, route: dict[str, Any]) -> list[dict[str, int | str]]:
+    if len(legs) < stop_count:
+        duration_seconds = parse_google_duration_seconds(route.get("duration"))
+        distance_meters = parse_google_distance_meters(route.get("distanceMeters"))
+        if stop_count == 1 and duration_seconds is not None and distance_meters is not None:
+            return [{"duration": route.get("duration"), "duration_seconds": duration_seconds, "distance_meters": distance_meters}]
+        return []
+
+    cumulative_duration_seconds = 0
+    cumulative_distance_meters = 0
+    totals = []
+    for leg in legs[:stop_count]:
+        leg_duration_seconds = parse_google_duration_seconds(leg.get("duration"))
+        leg_distance_meters = parse_google_distance_meters(leg.get("distanceMeters"))
+        if leg_duration_seconds is None or leg_distance_meters is None:
+            return []
+        cumulative_duration_seconds += leg_duration_seconds
+        cumulative_distance_meters += leg_distance_meters
+        totals.append(
+            {
+                "duration": f"{cumulative_duration_seconds}s",
+                "duration_seconds": cumulative_duration_seconds,
+                "distance_meters": cumulative_distance_meters,
+            }
         )
-    else:
-        rows = await database.fetch(
-            """
-            SELECT c.id, c.name, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude,
-                   tc.pickup_status, tc.dropoff_status
-            FROM trip_children tc
-            JOIN children c ON c.id = tc.child_id
-            WHERE tc.trip_id = $1 AND c.parent_id = $2
-            ORDER BY c.name
-            """,
-            trip["id"],
-            UUID(str(user_id)),
-        )
-    return list(rows), can_view_all_stops
+    return totals
+
+
+def build_route_payload(
+    *,
+    trip: asyncpg.Record,
+    route: dict[str, Any],
+    ordered_stops: list[dict[str, Any]],
+    cumulative_totals: list[dict[str, int | str]],
+    location_age_seconds: int,
+    target_index: int,
+    target_label: str,
+    scope: str,
+    include_private_stops: bool,
+) -> dict[str, Any] | None:
+    if target_index < 0 or target_index >= len(cumulative_totals) or target_index >= len(ordered_stops):
+        return None
+    target_total = cumulative_totals[target_index]
+    target_stop = ordered_stops[target_index]
+    now = datetime.now(UTC)
+    payload = {
+        "destination": target_stop["name"],
+        "target_label": target_label,
+        "scope": scope,
+        "trip_type": trip["trip_type"],
+        "stops": [
+            sanitize_route_stop(stop, include_private_destination=include_private_stops)
+            for stop in (ordered_stops if include_private_stops else [target_stop])
+        ],
+        "next_stop": sanitize_route_stop(ordered_stops[0], include_private_destination=include_private_stops),
+        "duration": target_total["duration"],
+        "duration_seconds": target_total["duration_seconds"],
+        "eta_at": (now + timedelta(seconds=int(target_total["duration_seconds"]))).isoformat(),
+        "distance_meters": target_total["distance_meters"],
+        "encoded_polyline": route.get("polyline", {}).get("encodedPolyline"),
+        "location_age_seconds": location_age_seconds,
+    }
+    total_remaining = cumulative_totals[-1]
+    first_leg = cumulative_totals[0]
+    payload["total_remaining_duration_seconds"] = total_remaining["duration_seconds"]
+    payload["total_remaining_distance_meters"] = total_remaining["distance_meters"]
+    payload["next_stop_duration_seconds"] = first_leg["duration_seconds"]
+    payload["next_stop_distance_meters"] = first_leg["distance_meters"]
+    return payload
+
+
+async def compute_google_route(
+    *,
+    origin: dict[str, Any],
+    destination: dict[str, Any],
+    intermediates: list[dict[str, Any]],
+    optimize_waypoints: bool,
+) -> tuple[dict[str, Any] | None, httpx.Response | None, dict[str, Any] | None]:
+    request_body: dict[str, Any] = {
+        "origin": origin,
+        "destination": destination,
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
+        "computeAlternativeRoutes": False,
+        "units": "METRIC",
+    }
+    if intermediates:
+        request_body["intermediates"] = intermediates
+        if optimize_waypoints and len(intermediates) > 1:
+            request_body["optimizeWaypointOrder"] = True
+    field_mask = "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.distanceMeters,routes.polyline.encodedPolyline"
+    if request_body.get("optimizeWaypointOrder"):
+        field_mask += ",routes.optimizedIntermediateWaypointIndex"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.post(
+                "https://routes.googleapis.com/directions/v2:computeRoutes",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Key": settings.google_routes_api_key,
+                    "X-Goog-FieldMask": field_mask,
+                },
+                json=request_body,
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        return None, response, request_body
+    routes = response.json().get("routes", [])
+    return (routes[0] if routes else None), response, request_body
 
 
 async def serialize_trip(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> dict[str, Any]:
@@ -2574,6 +2721,9 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
             "Waiting for updated driver location...",
             location_age_seconds=int(age),
         )
+    origin = google_lat_lng_waypoint(latest["latitude"], latest["longitude"])
+    if not origin:
+        return route_unavailable("location_missing", "Waiting for driver's location...")
     school = await database.fetchrow(
         """
         SELECT s.name, s.address, s.city, s.country
@@ -2594,68 +2744,92 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
         logger.warning("route compute unavailable", extra={"trip_id": str(trip_id), "reason": "routing_unavailable", "google_status": None})
         return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
 
-    request_body = {
-        "origin": {
-            "location": {
-                "latLng": {
-                    "latitude": float(latest["latitude"]),
-                    "longitude": float(latest["longitude"]),
-                }
-            }
-        },
-        "travelMode": "DRIVE",
-        "routingPreference": "TRAFFIC_AWARE",
-        "computeAlternativeRoutes": False,
-        "units": "METRIC",
+    child_rows, authorized_child_ids, can_view_all_stops = await trip_route_context(database, user["id"], trip)
+    if not child_rows:
+        return route_unavailable("destination_missing", "Destination unavailable")
+
+    pending_children = [
+        child for child in child_rows
+        if (trip["trip_type"] == "pickup" and child["pickup_status"] == "pending")
+        or (trip["trip_type"] == "dropoff" and child["dropoff_status"] == "pending")
+    ]
+    stop_rows = []
+    for child in pending_children:
+        stop = route_stop_from_child(child)
+        if not stop:
+            return route_unavailable("destination_missing", "Destination unavailable")
+        stop_rows.append((child, stop))
+
+    school_stop = {
+        "kind": "school",
+        "name": school["name"] or "School",
+        "waypoint": {"address": destination},
     }
-    stops = []
-    full_trip_route = trip["trip_type"] == "pickup"
-    target_label = "school"
-    route_destination = destination
+    ordered_stops: list[dict[str, Any]] = []
+    route: dict[str, Any] | None = None
+    response: httpx.Response | None = None
     if trip["trip_type"] == "pickup":
-        request_body["destination"] = {"address": destination}
-    else:
-        child_rows, full_trip_route = await trip_route_children_for_user(database, user["id"], trip)
-        if not child_rows:
-            return route_unavailable("destination_missing", "Destination unavailable")
-        pending_child_rows = [child for child in child_rows if child["dropoff_status"] == "pending"]
-        missing_home = []
-        for child in pending_child_rows:
-            waypoint = route_waypoint_from_child(child)
-            if not waypoint:
-                missing_home.append(child["name"])
-                continue
-            stops.append({
-                "child_id": str(child["id"]),
-                "name": child["name"],
-                "address": child_home_address(child),
-                "waypoint": waypoint,
-            })
-        if missing_home:
-            return route_unavailable("destination_missing", "Destination unavailable")
-        if not stops:
-            return route_unavailable("trip_not_active", "Live ETA is available only during an active trip")
-        target_label = "last home stop"
-        route_destination = stops[-1]["address"]
-        request_body["destination"] = stops[-1]["waypoint"]
-        if len(stops) > 1:
-            request_body["intermediates"] = [stop["waypoint"] for stop in stops[:-1]]
-        if not full_trip_route:
-            target_label = "your drop-off stop"
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(
-                "https://routes.googleapis.com/directions/v2:computeRoutes",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Goog-Api-Key": settings.google_routes_api_key,
-                    "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline",
-                },
-                json=request_body,
+        if stop_rows:
+            route, response, _ = await compute_google_route(
+                origin=origin,
+                destination=school_stop["waypoint"],
+                intermediates=[stop["waypoint"] for _, stop in stop_rows],
+                optimize_waypoints=True,
             )
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
-        response = getattr(exc, "response", None)
+            if route:
+                ordered_child_stops = route_ordered_intermediates(
+                    [stop for _, stop in stop_rows],
+                    route.get("optimizedIntermediateWaypointIndex"),
+                )
+                ordered_stops = [*ordered_child_stops, school_stop]
+        else:
+            route, response, _ = await compute_google_route(
+                origin=origin,
+                destination=school_stop["waypoint"],
+                intermediates=[],
+                optimize_waypoints=False,
+            )
+            if route:
+                ordered_stops = [school_stop]
+    else:
+        if not stop_rows:
+            return route_unavailable("trip_not_active", "Live ETA is available only during an active trip")
+        best_route: dict[str, Any] | None = None
+        best_response: httpx.Response | None = None
+        best_ordered_stops: list[dict[str, Any]] = []
+        for destination_index, (_, destination_stop) in enumerate(stop_rows):
+            intermediate_stops = [stop for index, (_, stop) in enumerate(stop_rows) if index != destination_index]
+            candidate_route, candidate_response, _ = await compute_google_route(
+                origin=origin,
+                destination=destination_stop["waypoint"],
+                intermediates=[stop["waypoint"] for stop in intermediate_stops],
+                optimize_waypoints=True,
+            )
+            if not candidate_route:
+                response = candidate_response
+                continue
+            ordered_intermediates = route_ordered_intermediates(
+                intermediate_stops,
+                candidate_route.get("optimizedIntermediateWaypointIndex"),
+            )
+            candidate_ordered_stops = [*ordered_intermediates, destination_stop]
+            candidate_distance = parse_google_distance_meters(candidate_route.get("distanceMeters"))
+            candidate_duration = parse_google_duration_seconds(candidate_route.get("duration"))
+            best_distance = parse_google_distance_meters(best_route.get("distanceMeters")) if best_route else None
+            best_duration = parse_google_duration_seconds(best_route.get("duration")) if best_route else None
+            if (
+                best_route is None
+                or (candidate_distance is not None and best_distance is not None and candidate_distance < best_distance)
+                or (candidate_distance == best_distance and candidate_duration is not None and best_duration is not None and candidate_duration < best_duration)
+            ):
+                best_route = candidate_route
+                best_response = candidate_response
+                best_ordered_stops = candidate_ordered_stops
+        route = best_route
+        response = best_response or response
+        ordered_stops = best_ordered_stops
+
+    if not route:
         google_error = safe_google_error(response)
         logger.warning(
             "route compute failed",
@@ -2669,17 +2843,10 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
         )
         return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
 
-    routes = response.json().get("routes", [])
-    if not routes:
-        logger.warning(
-            "route compute returned no routes",
-            extra={"trip_id": str(trip_id), "reason": "routing_unavailable", "google_http_status": getattr(response, "status_code", None)},
-        )
-        return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
-    route = routes[0]
     duration_seconds = parse_google_duration_seconds(route.get("duration"))
     distance_meters = parse_google_distance_meters(route.get("distanceMeters"))
-    if duration_seconds is None or distance_meters is None:
+    cumulative_totals = route_leg_totals(route.get("legs", []), len(ordered_stops), route)
+    if duration_seconds is None or distance_meters is None or len(cumulative_totals) != len(ordered_stops):
         logger.warning(
             "route compute missing required fields",
             extra={
@@ -2688,6 +2855,7 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
                 "google_http_status": getattr(response, "status_code", None),
                 "has_duration": duration_seconds is not None,
                 "has_distance_meters": distance_meters is not None,
+                "has_leg_totals": len(cumulative_totals) == len(ordered_stops),
             },
         )
         return route_unavailable("routing_unavailable", "ETA temporarily unavailable")
@@ -2701,21 +2869,52 @@ async def trip_route(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
             "has_distance_meters": True,
         },
     )
-    return {
-        "route": {
-            "destination": route_destination,
-            "target_label": target_label,
-            "scope": "whole_trip" if full_trip_route else "your_child",
-            "trip_type": trip["trip_type"],
-            "stops": [{key: value for key, value in stop.items() if key != "waypoint"} for stop in stops],
-            "duration": route.get("duration"),
-            "duration_seconds": duration_seconds,
-            "eta_at": (datetime.now(UTC) + timedelta(seconds=duration_seconds)).isoformat(),
-            "distance_meters": distance_meters,
-            "encoded_polyline": route.get("polyline", {}).get("encodedPolyline"),
-            "location_age_seconds": int(age),
-        }
-    }
+
+    if can_view_all_stops:
+        target_index = 0
+        target_label = "next recommended stop"
+        route_payload = build_route_payload(
+            trip=trip,
+            route=route,
+            ordered_stops=ordered_stops,
+            cumulative_totals=cumulative_totals,
+            location_age_seconds=int(age),
+            target_index=target_index,
+            target_label=target_label,
+            scope="driver_next_stop",
+            include_private_stops=True,
+        )
+        if route_payload:
+            route_payload["optimized_stop_order"] = [sanitize_route_stop(stop, include_private_destination=True) for stop in ordered_stops]
+        return {"route": route_payload}
+
+    target_index = None
+    target_label = "your child's stop"
+    for index, stop in enumerate(ordered_stops):
+        child_id = stop.get("child_id")
+        if child_id and UUID(child_id) in authorized_child_ids:
+            target_index = index
+            target_label = "your pickup stop" if trip["trip_type"] == "pickup" else "your drop-off stop"
+            break
+    if target_index is None and trip["trip_type"] == "pickup":
+        picked_up_child_ids = {child["id"] for child in child_rows if child["pickup_status"] == "picked_up"}
+        if authorized_child_ids & picked_up_child_ids:
+            target_index = len(ordered_stops) - 1
+            target_label = "school"
+    if target_index is None:
+        return route_unavailable("trip_not_active", "Live ETA is available only during an active trip")
+    route_payload = build_route_payload(
+        trip=trip,
+        route=route,
+        ordered_stops=ordered_stops,
+        cumulative_totals=cumulative_totals,
+        location_age_seconds=int(age),
+        target_index=target_index,
+        target_label=target_label,
+        scope="your_child",
+        include_private_stops=False,
+    )
+    return {"route": route_payload}
 
 
 @app.websocket("/api/trips/{trip_id}/location-stream")

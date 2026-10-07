@@ -160,9 +160,28 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_route_eta_available_after_start_with_driver_gps(self):
         ids = ActionIds()
         main.settings.google_routes_api_key = "routes-key"
-        database = RouteDatabase(ids, trip_type="pickup")
+        database = RouteDatabase(
+            ids,
+            trip_type="pickup",
+            children=[
+                Record(
+                    {
+                        "id": ids.child_id,
+                        "name": "Child",
+                        "parent_id": ids.parent_id,
+                        "home_address": "1 Home St",
+                        "home_city": "Berlin",
+                        "home_country": "DE",
+                        "home_latitude": None,
+                        "home_longitude": None,
+                        "pickup_status": "picked_up",
+                        "dropoff_status": "pending",
+                    }
+                )
+            ],
+        )
         response = MagicMock()
-        response.json.return_value = {"routes": [{"duration": "720s", "distanceMeters": 3200}]}
+        response.json.return_value = {"routes": [{"duration": "720s", "distanceMeters": 3200, "legs": [{"duration": "720s", "distanceMeters": 3200}]}]}
         client = AsyncMock()
         client.post.return_value = response
         client.__aenter__.return_value = client
@@ -183,7 +202,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         main.settings.google_routes_api_key = "routes-key"
         database = RouteDatabase(ids, trip_type="dropoff")
         response = MagicMock()
-        response.json.return_value = {"routes": [{"duration": "420s", "distanceMeters": 1500}]}
+        response.json.return_value = {"routes": [{"duration": "420s", "distanceMeters": 1500, "legs": [{"duration": "420s", "distanceMeters": 1500}]}]}
         client = AsyncMock()
         client.post.return_value = response
         client.__aenter__.return_value = client
@@ -195,9 +214,142 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["route"]["scope"], "your_child")
         self.assertEqual(result["route"]["target_label"], "your drop-off stop")
         self.assertEqual(result["route"]["distance_meters"], 1500)
-        self.assertEqual(result["route"]["stops"], [{"child_id": str(ids.child_id), "name": "Child", "address": "1 Home St, Berlin, DE"}])
+        self.assertEqual(result["route"]["stops"], [{"kind": "child_home", "child_id": str(ids.child_id), "name": "Child"}])
         request_body = client.post.await_args.kwargs["json"]
         self.assertEqual(request_body["destination"], {"address": "1 Home St, Berlin, DE"})
+
+    async def test_pickup_route_optimizes_stops_and_returns_child_specific_cumulative_eta(self):
+        ids = ActionIds()
+        parent_abhaoy = uuid4()
+        parent_shourish = uuid4()
+        parent_soumily = uuid4()
+        child_abhaoy = uuid4()
+        child_shourish = uuid4()
+        child_soumily = uuid4()
+        children = [
+            Record({"id": child_shourish, "name": "Shourish", "parent_id": parent_shourish, "home_address": "Shourish Home", "home_city": "Berlin", "home_country": "DE", "home_latitude": 52.501, "home_longitude": 13.401, "pickup_status": "pending", "dropoff_status": "pending"}),
+            Record({"id": child_abhaoy, "name": "Abhaoy", "parent_id": parent_abhaoy, "home_address": "Abhaoy Home", "home_city": "Berlin", "home_country": "DE", "home_latitude": 52.502, "home_longitude": 13.402, "pickup_status": "pending", "dropoff_status": "pending"}),
+            Record({"id": child_soumily, "name": "Soumily", "parent_id": parent_soumily, "home_address": "Soumily Home", "home_city": "Berlin", "home_country": "DE", "home_latitude": 52.503, "home_longitude": 13.403, "pickup_status": "pending", "dropoff_status": "pending"}),
+        ]
+        database = RouteDatabase(ids, trip_type="pickup", children=children)
+        main.settings.google_routes_api_key = "routes-key"
+        response = MagicMock()
+        response.json.return_value = {
+            "routes": [
+                {
+                    "duration": "1000s",
+                    "distanceMeters": 10000,
+                    "optimizedIntermediateWaypointIndex": [1, 0, 2],
+                    "legs": [
+                        {"duration": "100s", "distanceMeters": 1000},
+                        {"duration": "200s", "distanceMeters": 2000},
+                        {"duration": "300s", "distanceMeters": 3000},
+                        {"duration": "400s", "distanceMeters": 4000},
+                    ],
+                }
+            ]
+        }
+        client = AsyncMock()
+        client.post.return_value = response
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            abhaoy = await main.trip_route(ids.trip_id, {"id": str(parent_abhaoy)}, database)
+            shourish = await main.trip_route(ids.trip_id, {"id": str(parent_shourish)}, database)
+            soumily = await main.trip_route(ids.trip_id, {"id": str(parent_soumily)}, database)
+            driver = await main.trip_route(ids.trip_id, {"id": str(ids.driver_id)}, database)
+
+        self.assertEqual(abhaoy["route"]["duration_seconds"], 100)
+        self.assertEqual(abhaoy["route"]["distance_meters"], 1000)
+        self.assertEqual(shourish["route"]["duration_seconds"], 300)
+        self.assertEqual(shourish["route"]["distance_meters"], 3000)
+        self.assertEqual(soumily["route"]["duration_seconds"], 600)
+        self.assertEqual(soumily["route"]["distance_meters"], 6000)
+        self.assertEqual({abhaoy["route"]["distance_meters"], shourish["route"]["distance_meters"], soumily["route"]["distance_meters"]}, {1000, 3000, 6000})
+        self.assertEqual(driver["route"]["target_label"], "next recommended stop")
+        self.assertEqual(driver["route"]["next_stop"]["child_id"], str(child_abhaoy))
+        self.assertEqual([stop["child_id"] for stop in driver["route"]["optimized_stop_order"] if stop["kind"] == "child_home"], [str(child_abhaoy), str(child_shourish), str(child_soumily)])
+        self.assertEqual(driver["route"]["total_remaining_distance_meters"], 10000)
+        self.assertEqual(abhaoy["route"]["stops"], [{"kind": "child_home", "child_id": str(child_abhaoy), "name": "Abhaoy"}])
+        self.assertNotIn("address", abhaoy["route"]["stops"][0])
+        self.assertNotIn(str(child_shourish), str(abhaoy["route"]))
+        request_body = client.post.await_args.kwargs["json"]
+        self.assertTrue(request_body["optimizeWaypointOrder"])
+        self.assertEqual(request_body["destination"], {"address": "1 School St, Berlin, DE"})
+
+    async def test_pickup_parent_with_completed_pickup_gets_school_eta(self):
+        ids = ActionIds()
+        main.settings.google_routes_api_key = "routes-key"
+        database = RouteDatabase(
+            ids,
+            trip_type="pickup",
+            children=[
+                Record({"id": ids.child_id, "name": "Child", "parent_id": ids.parent_id, "home_address": "1 Home St", "home_city": "Berlin", "home_country": "DE", "home_latitude": None, "home_longitude": None, "pickup_status": "picked_up", "dropoff_status": "pending"}),
+                Record({"id": uuid4(), "name": "Other", "parent_id": uuid4(), "home_address": "2 Home St", "home_city": "Berlin", "home_country": "DE", "home_latitude": None, "home_longitude": None, "pickup_status": "pending", "dropoff_status": "pending"}),
+            ],
+        )
+        response = MagicMock()
+        response.json.return_value = {
+            "routes": [
+                {
+                    "duration": "600s",
+                    "distanceMeters": 6000,
+                    "legs": [
+                        {"duration": "200s", "distanceMeters": 2000},
+                        {"duration": "400s", "distanceMeters": 4000},
+                    ],
+                }
+            ]
+        }
+        client = AsyncMock()
+        client.post.return_value = response
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.trip_route(ids.trip_id, {"id": str(ids.parent_id)}, database)
+
+        self.assertEqual(result["route"]["target_label"], "school")
+        self.assertEqual(result["route"]["duration_seconds"], 600)
+        self.assertEqual(result["route"]["distance_meters"], 6000)
+
+    async def test_dropoff_route_uses_remaining_homes_and_removes_completed_stops(self):
+        ids = ActionIds()
+        completed_child = ids.child_id
+        parent_completed = ids.parent_id
+        parent_next = uuid4()
+        parent_final = uuid4()
+        child_next = uuid4()
+        child_final = uuid4()
+        children = [
+            Record({"id": completed_child, "name": "Completed", "parent_id": parent_completed, "home_address": "Completed Home", "home_city": "Berlin", "home_country": "DE", "home_latitude": None, "home_longitude": None, "pickup_status": "picked_up", "dropoff_status": "dropped_off"}),
+            Record({"id": child_next, "name": "Next", "parent_id": parent_next, "home_address": "Next Home", "home_city": "Berlin", "home_country": "DE", "home_latitude": None, "home_longitude": None, "pickup_status": "picked_up", "dropoff_status": "pending"}),
+            Record({"id": child_final, "name": "Final", "parent_id": parent_final, "home_address": "Final Home", "home_city": "Berlin", "home_country": "DE", "home_latitude": None, "home_longitude": None, "pickup_status": "picked_up", "dropoff_status": "pending"}),
+        ]
+        database = RouteDatabase(ids, trip_type="dropoff", children=children)
+        main.settings.google_routes_api_key = "routes-key"
+        slower = MagicMock()
+        slower.json.return_value = {"routes": [{"duration": "900s", "distanceMeters": 9000, "legs": [{"duration": "500s", "distanceMeters": 5000}, {"duration": "400s", "distanceMeters": 4000}]}]}
+        faster = MagicMock()
+        faster.json.return_value = {"routes": [{"duration": "600s", "distanceMeters": 3000, "legs": [{"duration": "200s", "distanceMeters": 1000}, {"duration": "400s", "distanceMeters": 2000}]}]}
+        client = AsyncMock()
+        client.post.side_effect = [slower, faster, slower, faster, slower, faster]
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            driver = await main.trip_route(ids.trip_id, {"id": str(ids.driver_id)}, database)
+            next_parent = await main.trip_route(ids.trip_id, {"id": str(parent_next)}, database)
+            completed_parent = await main.trip_route(ids.trip_id, {"id": str(parent_completed)}, database)
+
+        self.assertEqual(driver["route"]["next_stop"]["child_id"], str(child_next))
+        self.assertEqual([stop["child_id"] for stop in driver["route"]["optimized_stop_order"]], [str(child_next), str(child_final)])
+        self.assertNotIn(str(completed_child), str(driver["route"]))
+        self.assertEqual(next_parent["route"]["duration_seconds"], 200)
+        self.assertEqual(next_parent["route"]["distance_meters"], 1000)
+        self.assertIsNone(completed_parent["route"])
+        self.assertEqual(completed_parent["reason"], "trip_not_active")
 
     async def test_route_eta_rejects_unauthorized_user(self):
         ids = ActionIds()
@@ -859,6 +1011,7 @@ class RouteDatabase:
         latest_location=True,
         latest_location_received_at=None,
         school=True,
+        children=None,
     ):
         self.ids = ids
         self.parent_allowed = parent_allowed
@@ -899,6 +1052,22 @@ class RouteDatabase:
                     "received_at": latest_location_received_at or datetime.now(UTC),
                 }
             )
+        self.children = children or [
+            Record(
+                {
+                    "id": ids.child_id,
+                    "name": "Child",
+                    "parent_id": ids.parent_id,
+                    "home_address": "1 Home St",
+                    "home_city": "Berlin",
+                    "home_country": "DE",
+                    "home_latitude": None,
+                    "home_longitude": None,
+                    "pickup_status": "pending",
+                    "dropoff_status": "pending",
+                }
+            )
+        ]
 
     async def fetchrow(self, query, *args):
         if "SELECT * FROM trips WHERE id" in query:
@@ -917,30 +1086,16 @@ class RouteDatabase:
         if "SELECT created_by FROM carpool_groups" in query:
             return self.ids.organiser_id
         if "FROM trip_children tc" in query and "c.parent_id" in query:
-            return 1 if self.parent_allowed and args[1] == self.ids.parent_id else None
+            return 1 if self.parent_allowed and any(child["parent_id"] == args[1] for child in self.children) else None
         if "FROM roster_change_requests" in query:
             return None
         raise AssertionError(query)
 
     async def fetch(self, query, *args):
         if "FROM trip_children tc" in query and "JOIN children" in query:
-            if len(args) > 1 and args[1] != self.ids.parent_id:
-                return []
-            return [
-                Record(
-                    {
-                        "id": self.ids.child_id,
-                        "name": "Child",
-                        "home_address": "1 Home St",
-                        "home_city": "Berlin",
-                        "home_country": "DE",
-                        "home_latitude": None,
-                        "home_longitude": None,
-                        "pickup_status": "pending",
-                        "dropoff_status": "pending",
-                    }
-                )
-            ]
+            if len(args) > 1:
+                return [child for child in self.children if child["parent_id"] == args[1]]
+            return self.children
         raise AssertionError(query)
 
 
