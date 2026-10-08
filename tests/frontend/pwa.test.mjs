@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=25/);
-  assert.match(worker, /schoolhop-shell-v25/);
-  assert.match(worker, /\/static\/app\.js\?v=25/);
+  assert.match(html, /\/static\/app\.js\?v=26/);
+  assert.match(worker, /schoolhop-shell-v26/);
+  assert.match(worker, /\/static\/app\.js\?v=26/);
 });
 
 test("registration UI uses verified account creation flow", async () => {
@@ -46,7 +46,7 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   const html = await read("app/static/index.html");
   const app = await read("app/static/app.js");
 
-  for (const tab of ["home", "group", "children", "roster", "trip", "alerts"]) {
+  for (const tab of ["home", "group", "children", "roster", "trip", "alerts", "account"]) {
     assert.match(html, new RegExp(`data-tab="${tab}"`));
   }
   assert.match(html, /id="showTripHistory"/);
@@ -67,6 +67,9 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   assert.doesNotMatch(app, /rosterHistoryTripList/);
   assert.match(app, /Invite token:/);
   assert.match(app, /Code:/);
+  assert.match(html, /id="declineInvite"/);
+  assert.match(app, /schoolhop_pending_invite/);
+  assert.match(app, /\/api\/invitations\/\$\{encodeURIComponent\(token\)\}\/decline/);
   assert.match(app, /Access request sent to the group creator/);
   assert.match(app, /You have to leave your existing group first/);
   assert.match(app, /\/api\/groups\/discover/);
@@ -91,6 +94,21 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   assert.match(html, /Next Trip/);
   assert.match(app, /data-tracking="\$\{tracking \? "on" : "off"\}"/);
   assert.match(app, /target\.closest\("\.trip-card\[data-tracking='on'\]"\)/);
+});
+
+test("account deletion and Australian postcode controls are present", async () => {
+  const html = await read("app/static/index.html");
+  const app = await read("app/static/app.js");
+
+  assert.match(html, /Account Settings/);
+  assert.match(html, /id="deleteAccount"/);
+  assert.match(app, /api\("\/api\/me", \{ method: "DELETE"/);
+  assert.match(html, /name="home_postcode"/);
+  assert.match(html, /pattern="\[0-9\]\{4\}"/);
+  assert.doesNotMatch(html, /name="home_country"/);
+  assert.match(app, /valid four-digit Australian postcode/);
+  assert.match(app, /normalizeGroupName/);
+  assert.match(app, /A group with this name already exists for this school/);
 });
 
 test("home screen orders pending actions, current trip, next trip, and upcoming trips", async () => {

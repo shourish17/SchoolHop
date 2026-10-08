@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, date, datetime, timedelta, time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import app.main as main
 
@@ -108,6 +110,62 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
 
+    def test_child_postcode_uses_australian_four_digit_validation(self):
+        payload = {
+            "school_id": uuid4(),
+            "name": "Child",
+            "year_group": "2",
+            "home_postcode": "3000",
+            "emergency_contact_name": "Parent",
+            "emergency_contact_phone": "0400000000",
+        }
+
+        self.assertEqual(main.ChildIn(**payload).home_postcode, "3000")
+        with self.assertRaises(ValidationError):
+            main.ChildIn(**{**payload, "home_postcode": "DE"})
+
+    def test_migration_adds_concurrency_safe_group_and_roster_uniqueness(self):
+        migration = Path("migrations/010_account_invitation_roster_controls.sql").read_text()
+
+        self.assertIn("carpool_groups_school_normalized_name_idx", migration)
+        self.assertIn("ON carpool_groups (school_id, name_normalized)", migration)
+        self.assertIn("trips_group_schedule_type_active_idx", migration)
+        self.assertIn("ON trips (group_id, service_date, trip_type, expected_time)", migration)
+        self.assertIn("RAISE EXCEPTION 'Duplicate active/future roster timestamps exist", migration)
+
+    async def test_account_deletion_blocks_active_future_driver_assignments(self):
+        database = AccountDeletionPolicyDatabase(active_driver_assignments=1)
+
+        reasons = await main.block_account_deletion_reasons(database, uuid4())
+
+        self.assertIn("Resolve active or future driving assignments first", reasons)
+
+    async def test_invitation_decline_marks_resolved_without_joining(self):
+        ids = ActionIds()
+        invitation = Record(
+            {
+                "id": uuid4(),
+                "group_id": ids.group_id,
+                "email": "invitee@example.com",
+                "status": "pending",
+                "expires_at": datetime.now(UTC) + timedelta(days=1),
+            }
+        )
+        database = InvitationDecisionDatabase(invitation)
+
+        result = await main.decline_invitation("invite-token", {"id": str(ids.parent_id), "email": "invitee@example.com"}, database)
+
+        self.assertEqual(result["status"], "declined")
+        self.assertTrue(any("UPDATE invitations" in query and "declined" in query for query, _ in database.executed))
+        self.assertFalse(any("INSERT INTO group_members" in query for query, _ in database.executed))
+
+    async def test_member_removal_policy_blocks_active_future_driver_assignments(self):
+        database = MemberRemovalPolicyDatabase(conflicts=1)
+
+        conflicts = await main.active_trip_conflicts_for_member(database, uuid4(), uuid4())
+
+        self.assertEqual(conflicts, 1)
+
     async def test_current_future_roster_and_history_filtering(self):
         user_id = uuid4()
         group_id = uuid4()
@@ -133,7 +191,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([trip["id"] for trip in current], [str(planned_today["id"]), str(delayed_future["id"])])
         self.assertEqual(
             [trip["id"] for trip in history],
-            [str(ignored_future["id"]), str(cancelled_future["id"]), str(completed_today["id"]), str(past_planned["id"])],
+            [str(cancelled_future["id"]), str(completed_today["id"]), str(past_planned["id"])],
         )
 
     async def test_trip_list_uses_batched_serialization_queries(self):
@@ -1720,7 +1778,11 @@ class TripListDatabase:
         if "FROM trip_locations" in query:
             return []
         if "FROM trips" in query and "CURRENT_DATE" in query:
-            rows = [trip for trip in self.trips if trip["service_date"] < date.today() or trip["status"] in {"completed", "cancelled", "driver_unavailable", "ignored"}]
+            rows = [
+                trip for trip in self.trips
+                if trip["status"] != "ignored"
+                and (trip["service_date"] < date.today() or trip["status"] in {"completed", "cancelled", "driver_unavailable"})
+            ]
             return sorted(rows, key=lambda trip: (trip["service_date"], trip["expected_time"]), reverse=True)
         if "FROM trips" in query:
             from_date = args[1]
@@ -1735,6 +1797,48 @@ class TripListDatabase:
             return sorted(rows, key=lambda trip: (trip["service_date"], trip["expected_time"]))
         if "FROM roster_change_requests" in query:
             return []
+        raise AssertionError(query)
+
+
+class AccountDeletionPolicyDatabase:
+    def __init__(self, active_driver_assignments=0):
+        self.active_driver_assignments = active_driver_assignments
+
+    async def fetchval(self, query, *args):
+        if "FROM trips t" in query and "t.driver_user_id" in query:
+            return self.active_driver_assignments
+        return 0
+
+
+class InvitationDecisionDatabase:
+    def __init__(self, invitation):
+        self.invitation = invitation
+        self.executed = []
+
+    async def fetchrow(self, query, *args):
+        if "FROM invitations WHERE token" in query:
+            return self.invitation
+        raise AssertionError(query)
+
+    async def execute(self, query, *args):
+        self.executed.append((query, args))
+        if "UPDATE invitations" in query:
+            self.invitation["status"] = "declined"
+        return None
+
+    async def fetch(self, query, *args):
+        if "mobile_devices" in query:
+            return []
+        raise AssertionError(query)
+
+
+class MemberRemovalPolicyDatabase:
+    def __init__(self, conflicts=0):
+        self.conflicts = conflicts
+
+    async def fetchval(self, query, *args):
+        if "FROM trips" in query and "driver_user_id" in query:
+            return self.conflicts
         raise AssertionError(query)
 
 

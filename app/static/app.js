@@ -3,6 +3,7 @@ const state = {
   config: {},
   me: null,
   registration: { email: null, name: null, phone: null, token: null },
+  pendingInviteToken: localStorage.getItem("schoolhop_pending_invite"),
   schools: [],
   groups: [],
   discoverGroups: [],
@@ -72,7 +73,13 @@ async function api(path, options = {}) {
   if (duration > 400 && path.startsWith("/api/")) {
     console.info("[api] slow request", { path, duration: Math.round(duration), serverTiming: response.headers.get("Server-Timing") });
   }
-  if (!response.ok) throw new Error((data && data.detail) || response.statusText);
+  if (!response.ok) {
+    const detail = data && data.detail;
+    const message = detail && typeof detail === "object"
+      ? [detail.message, ...(detail.reasons || [])].filter(Boolean).join(" ")
+      : detail;
+    throw new Error(message || response.statusText);
+  }
   return data;
 }
 
@@ -108,6 +115,10 @@ function formJSON(form) {
     if (data[key] === "") data[key] = null;
   });
   return data;
+}
+
+function normalizeGroupName(name) {
+  return String(name || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function fillSelect(select, rows, label, value = "id") {
@@ -297,9 +308,13 @@ function registerServiceWorker() {
 
 function hydrateUrlActions() {
   const params = new URLSearchParams(window.location.search);
-  const token = params.get("invite");
+  const token = params.get("invite") || state.pendingInviteToken;
   const input = document.querySelector("#acceptInviteForm input[name='token']");
-  if (token && input) input.value = token;
+  if (token) {
+    state.pendingInviteToken = token;
+    localStorage.setItem("schoolhop_pending_invite", token);
+    if (input) input.value = token;
+  }
   const resetToken = params.get("reset");
   if (resetToken) {
     const resetInput = document.querySelector("#resetPasswordForm input[name='token']");
@@ -392,14 +407,21 @@ function wireEvents() {
     if (!data.country) data.country = "DE";
     return api("/api/schools", { method: "POST", body: JSON.stringify(data) });
   });
-  submit("groupForm", async (form) => api("/api/groups", { method: "POST", body: JSON.stringify(formJSON(form)) }));
+  submit("groupForm", async (form) => {
+    const data = formJSON(form);
+    const duplicate = state.discoverGroups.find((group) => group.school_id === data.school_id && normalizeGroupName(group.name) === normalizeGroupName(data.name));
+    if (duplicate) throw new Error("A group with this name already exists for this school.");
+    return api("/api/groups", { method: "POST", body: JSON.stringify(data) });
+  });
   submit("acceptInviteForm", async (form) => {
     const token = formJSON(form).token;
     const result = await api(`/api/invitations/${encodeURIComponent(token)}/accept`, { method: "POST", body: "{}" });
     state.pendingActions = state.pendingActions.filter((action) => action.type !== "invitation" || action.action_url !== `/?invite=${token}`);
+    clearPendingInvite(token);
     renderAll();
     return result;
   });
+  $("declineInvite").addEventListener("click", declineInvitation);
   submit("requestAccessForm", async (form) => {
     const data = formJSON(form);
     delete data.school_id;
@@ -430,7 +452,8 @@ function wireEvents() {
     const data = formJSON(form);
     data.child_ids = [...$("tripChildren").querySelectorAll("input:checked")].map((input) => input.value);
     if (!data.child_ids.length) throw new Error("Choose at least one child");
-    return api(`/api/groups/${selectedGroupId()}/trips`, { method: "POST", body: JSON.stringify(data) });
+    const submitter = form.querySelector("button[type='submit']");
+    return withButtonLock(submitter, () => api(`/api/groups/${selectedGroupId()}/trips`, { method: "POST", body: JSON.stringify(data) }));
   });
 
   $("groupSelect").addEventListener("change", () => refreshGroupContext().catch((error) => toast(error.message)));
@@ -449,6 +472,7 @@ function wireEvents() {
     refresh();
   });
   $("leaveGroup").addEventListener("click", leaveGroup);
+  $("deleteAccount").addEventListener("click", deleteAccount);
   $("cancelChildEdit").addEventListener("click", resetChildForm);
   $("acceptTrip").addEventListener("click", (event) => tripAction("responses", { status: "accepted" }, event.currentTarget));
   $("declineTrip").addEventListener("click", (event) => tripAction("responses", { status: "declined" }, event.currentTarget));
@@ -683,6 +707,7 @@ function renderAll() {
   renderTrips();
   renderChildren();
   renderMore();
+  renderAccount();
   renderNotifications();
 }
 
@@ -978,6 +1003,11 @@ function renderMore() {
     ${state.group.group.created_by === state.me.id ? `<div><h3>Access requests</h3><div class="stack">${joinRequests || empty("No pending access requests.")}</div></div>` : ""}`;
 }
 
+function renderAccount() {
+  const accountEmail = $("accountEmail");
+  if (accountEmail) accountEmail.textContent = state.me ? state.me.email : "";
+}
+
 function renderNotifications() {
   $("notificationList").innerHTML = state.notifications.length ? state.notifications.slice(0, 8).map((n) => `
     <article class="item-card notification-card" data-notification="${escapeHTML(n.id)}">
@@ -1143,7 +1173,7 @@ async function clearReadNotifications() {
 }
 
 function formatHomeAddress(child) {
-  return [child.home_address, child.home_city, child.home_country].filter(Boolean).join(", ");
+  return [child.home_address, child.home_city, child.home_postcode].filter(Boolean).join(", ");
 }
 
 function updateTripInState(updatedTrip) {
@@ -1185,16 +1215,62 @@ async function withButtonLock(button, callback) {
   }
 }
 
+function clearPendingInvite(token) {
+  if (!token || state.pendingInviteToken !== token) return;
+  state.pendingInviteToken = null;
+  localStorage.removeItem("schoolhop_pending_invite");
+  const url = new URL(window.location.href);
+  if (url.searchParams.get("invite") === token) {
+    url.searchParams.delete("invite");
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }
+}
+
+async function declineInvitation() {
+  const token = $("acceptInviteForm").elements.token.value.trim();
+  if (!token) return toast("Enter an invitation code first");
+  if (!window.confirm("Decline this group invitation?")) return;
+  try {
+    await api(`/api/invitations/${encodeURIComponent(token)}/decline`, { method: "POST", body: "{}" });
+    state.pendingActions = state.pendingActions.filter((action) => action.type !== "invitation" || action.action_url !== `/?invite=${token}`);
+    clearPendingInvite(token);
+    $("acceptInviteForm").reset();
+    renderAll();
+    toast("Invitation declined");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
 async function saveChild(form) {
   const data = formJSON(form);
   const childId = data.child_id;
   delete data.child_id;
-  if (!data.home_country) data.home_country = "DE";
+  if (!data.home_postcode || !/^\d{4}$/.test(data.home_postcode)) throw new Error("Enter a valid four-digit Australian postcode.");
+  if (!data.home_country) data.home_country = "AU";
   if (childId) {
     await api(`/api/children/${childId}`, { method: "PATCH", body: JSON.stringify(data) });
     resetChildForm();
   } else {
     await api("/api/children", { method: "POST", body: JSON.stringify(data) });
+  }
+}
+
+async function deleteAccount() {
+  const confirmation = window.prompt("Type DELETE to permanently delete your SchoolHop account.");
+  if (confirmation == null) return;
+  try {
+    await api("/api/me", { method: "DELETE", body: JSON.stringify({ confirmation }) });
+    stopTracking();
+    localStorage.removeItem("schoolhop_token");
+    localStorage.removeItem("schoolhop_pending_invite");
+    state.token = null;
+    state.me = null;
+    state.pendingInviteToken = null;
+    await refresh();
+    toast("Account deleted");
+  } catch (error) {
+    toast(error.message);
   }
 }
 
@@ -1687,6 +1763,8 @@ async function openActionUrl(actionUrl) {
   const url = new URL(actionUrl, window.location.origin);
   const invite = url.searchParams.get("invite");
   if (invite) {
+    state.pendingInviteToken = invite;
+    localStorage.setItem("schoolhop_pending_invite", invite);
     const input = document.querySelector("#acceptInviteForm input[name='token']");
     if (input) input.value = invite;
     setTab("group");

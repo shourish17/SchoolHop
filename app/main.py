@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -187,6 +187,14 @@ class GroupIn(BaseModel):
     school_id: UUID
     name: str = Field(min_length=2, max_length=160)
 
+    @field_validator("name")
+    @classmethod
+    def group_name_has_content(cls, value: str) -> str:
+        normalized = normalize_group_name(value)
+        if not normalized:
+            raise ValueError("Group name is required")
+        return value.strip()
+
 
 class InviteIn(BaseModel):
     email: EmailStr
@@ -206,6 +214,18 @@ class GroupMemberIn(BaseModel):
     user_id: UUID
 
 
+class TransferGroupOwnershipIn(BaseModel):
+    new_creator_user_id: UUID
+
+
+class ReassignTripDriverIn(BaseModel):
+    driver_user_id: UUID
+
+
+class AccountDeletionIn(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=80)
+
+
 class ChildIn(BaseModel):
     school_id: UUID
     name: str = Field(min_length=1, max_length=120)
@@ -213,7 +233,8 @@ class ChildIn(BaseModel):
     pickup_notes: str | None = Field(default=None, max_length=1000)
     home_address: str | None = Field(default=None, max_length=240)
     home_city: str | None = Field(default=None, max_length=120)
-    home_country: str = Field(default="DE", min_length=2, max_length=2)
+    home_postcode: str = Field(pattern=r"^\d{4}$")
+    home_country: str = Field(default="AU", min_length=2, max_length=2)
     home_latitude: float | None = Field(default=None, ge=-90, le=90)
     home_longitude: float | None = Field(default=None, ge=-180, le=180)
     home_place_id: str | None = Field(default=None, max_length=240)
@@ -296,6 +317,10 @@ def create_token(user_id: UUID) -> str:
 
 def normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+def normalize_group_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
 
 
 def verification_code() -> str:
@@ -571,6 +596,13 @@ async def require_group_creator(database: asyncpg.Pool, user_id: UUID | str, gro
     return member
 
 
+async def require_group_admin(database: asyncpg.Pool, user_id: UUID | str, group_id: UUID | str) -> asyncpg.Record:
+    member = await require_group_member(database, user_id, group_id)
+    if member["role"] != "creator":
+        raise HTTPException(status_code=403, detail="Group admin permission required")
+    return member
+
+
 async def require_group_member(database: asyncpg.Pool, user_id: UUID | str, group_id: UUID | str) -> asyncpg.Record:
     member = await database.fetchrow(
         """
@@ -585,6 +617,109 @@ async def require_group_member(database: asyncpg.Pool, user_id: UUID | str, grou
     if not member:
         raise HTTPException(status_code=403, detail="Group membership required")
     return member
+
+
+async def active_future_driver_assignment_count(database: asyncpg.Pool, user_id: UUID | str, group_id: UUID | str | None = None) -> int:
+    return int(
+        await database.fetchval(
+            """
+            SELECT count(*)
+            FROM trips t
+            WHERE t.driver_user_id = $1
+              AND t.status IN ('planned', 'started', 'delayed', 'driver_unavailable')
+              AND (t.service_date >= CURRENT_DATE OR t.status = 'started')
+              AND ($2::uuid IS NULL OR t.group_id = $2)
+            """,
+            UUID(str(user_id)),
+            UUID(str(group_id)) if group_id else None,
+        )
+        or 0
+    )
+
+
+async def assert_driver_approved_for_trip(database: asyncpg.Pool, group_id: UUID | str, trip_id: UUID | str, driver_user_id: UUID | str) -> None:
+    await require_group_member(database, driver_user_id, group_id)
+    missing_approval = await database.fetchval(
+        """
+        SELECT 1
+        FROM trip_children tc
+        LEFT JOIN driver_approvals da
+          ON da.group_id = $1
+         AND da.child_id = tc.child_id
+         AND da.driver_user_id = $2
+         AND da.approved = true
+        WHERE tc.trip_id = $3
+          AND da.id IS NULL
+        LIMIT 1
+        """,
+        UUID(str(group_id)),
+        UUID(str(driver_user_id)),
+        UUID(str(trip_id)),
+    )
+    if missing_approval:
+        raise HTTPException(status_code=403, detail="Replacement driver is not approved for every child on this trip")
+
+
+async def block_account_deletion_reasons(database: asyncpg.Pool, user_id: UUID | str) -> list[str]:
+    user_uuid = UUID(str(user_id))
+    reasons: list[str] = []
+    if await active_future_driver_assignment_count(database, user_uuid):
+        reasons.append("Resolve active or future driving assignments first")
+    pending_driver_responses = await database.fetchval(
+        """
+        SELECT count(*)
+        FROM trips t
+        LEFT JOIN trip_responses tr ON tr.trip_id = t.id AND tr.user_id = $1
+        WHERE t.driver_user_id = $1
+          AND t.status IN ('planned', 'delayed')
+          AND t.service_date >= CURRENT_DATE
+          AND tr.id IS NULL
+        """,
+        user_uuid,
+    )
+    if pending_driver_responses:
+        reasons.append("Accept, decline, or reassign pending driver assignments first")
+    pending_invites = await database.fetchval(
+        "SELECT count(*) FROM invitations i JOIN users u ON u.email = i.email WHERE u.id = $1 AND i.status = 'pending' AND i.expires_at > now()",
+        user_uuid,
+    )
+    if pending_invites:
+        reasons.append("Accept or decline pending group invitations first")
+    open_group_requests = await database.fetchval(
+        "SELECT count(*) FROM group_join_requests WHERE requester_user_id = $1 AND status = 'pending'",
+        user_uuid,
+    )
+    if open_group_requests:
+        reasons.append("Resolve pending group access requests first")
+    creator_groups = await database.fetchval(
+        """
+        SELECT count(*)
+        FROM group_members gm
+        WHERE gm.user_id = $1 AND gm.status = 'active' AND gm.role = 'creator'
+        """,
+        user_uuid,
+    )
+    if creator_groups:
+        reasons.append("Transfer group ownership or close owned groups safely first")
+    return reasons
+
+
+async def active_trip_conflicts_for_member(database: asyncpg.Pool, group_id: UUID | str, member_user_id: UUID | str) -> int:
+    return int(
+        await database.fetchval(
+            """
+            SELECT count(*)
+            FROM trips
+            WHERE group_id = $1
+              AND driver_user_id = $2
+              AND status IN ('planned', 'started', 'delayed', 'driver_unavailable')
+              AND (service_date >= CURRENT_DATE OR status = 'started')
+            """,
+            UUID(str(group_id)),
+            UUID(str(member_user_id)),
+        )
+        or 0
+    )
 
 
 async def trip_with_permission(database: asyncpg.Pool, user_id: UUID | str, trip_id: UUID | str) -> asyncpg.Record:
@@ -698,7 +833,7 @@ async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, tri
         rows = await database.fetch(
             """
             SELECT tc.*, c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
-                   c.parent_id, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
+                   c.parent_id, c.home_address, c.home_city, c.home_postcode, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
             FROM trip_children tc
             JOIN children c ON c.id = tc.child_id
             WHERE tc.trip_id = $1
@@ -710,7 +845,7 @@ async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, tri
         rows = await database.fetch(
             """
             SELECT tc.*, c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
-                   c.parent_id, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
+                   c.parent_id, c.home_address, c.home_city, c.home_postcode, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
             FROM trip_children tc
             JOIN children c ON c.id = tc.child_id
             WHERE tc.trip_id = $1 AND c.parent_id = $2
@@ -725,6 +860,7 @@ async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, tri
             if child.get("parent_id") != str(user_id):
                 child["home_address"] = None
                 child["home_city"] = None
+                child["home_postcode"] = None
                 child["home_country"] = None
                 child["home_latitude"] = None
                 child["home_longitude"] = None
@@ -735,7 +871,7 @@ async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, tri
 def child_home_address(child: asyncpg.Record | dict[str, Any]) -> str:
     getter = child.get if isinstance(child, dict) else child.__getitem__
     parts = []
-    for key in ("home_address", "home_city", "home_country"):
+    for key in ("home_address", "home_city", "home_postcode", "home_country"):
         value = getter(key)
         if value:
             parts.append(str(value))
@@ -835,7 +971,7 @@ async def trip_route_context(database: asyncpg.Pool, user_id: UUID | str, trip: 
     can_view_all_stops = is_driver or creator == UUID(str(user_id)) or bool(proposed_swap)
     rows = await database.fetch(
         """
-        SELECT c.id, c.name, c.parent_id, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude,
+        SELECT c.id, c.name, c.parent_id, c.home_address, c.home_city, c.home_postcode, c.home_country, c.home_latitude, c.home_longitude,
                tc.pickup_status, tc.dropoff_status
         FROM trip_children tc
         JOIN children c ON c.id = tc.child_id
@@ -1046,7 +1182,7 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
         database.fetch(
             """
             SELECT tc.*, c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
-                   c.parent_id, c.home_address, c.home_city, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
+                   c.parent_id, c.home_address, c.home_city, c.home_postcode, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
             FROM trip_children tc
             JOIN children c ON c.id = tc.child_id
             WHERE tc.trip_id = ANY($1::uuid[])
@@ -1099,6 +1235,7 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
             if not is_driver and child_payload.get("parent_id") != str(user_uuid):
                 child_payload["home_address"] = None
                 child_payload["home_city"] = None
+                child_payload["home_postcode"] = None
                 child_payload["home_country"] = None
                 child_payload["home_latitude"] = None
                 child_payload["home_longitude"] = None
@@ -1143,13 +1280,21 @@ async def list_pending_actions(user: UserDep, database: DbDep) -> list[dict[str,
     invitation_rows = await database.fetch(
         """
         SELECT id, token, email, expires_at, created_at
-        FROM invitations
-        WHERE email = lower($1)
-          AND status = 'pending'
-          AND expires_at > now()
+        FROM invitations i
+        WHERE i.email = lower($1)
+          AND i.status = 'pending'
+          AND i.expires_at > now()
+          AND NOT EXISTS (
+              SELECT 1
+              FROM group_members gm
+              WHERE gm.group_id = i.group_id
+                AND gm.user_id = $2
+                AND gm.status = 'active'
+          )
         ORDER BY created_at DESC
         """,
         user["email"],
+        user_id,
     )
     assignment_rows = await database.fetch(
         """
@@ -1487,6 +1632,86 @@ async def me(user: UserDep) -> dict[str, Any]:
     return {"user": {k: v for k, v in user.items() if k != "password_hash"}}
 
 
+@app.delete("/api/me")
+async def delete_account(payload: AccountDeletionIn, user: UserDep, database: DbDep) -> dict[str, str]:
+    if payload.confirmation.strip().upper() != "DELETE":
+        raise HTTPException(status_code=400, detail="Type DELETE to confirm account deletion")
+    user_id = UUID(user["id"])
+    reasons = await block_account_deletion_reasons(database, user_id)
+    if reasons:
+        raise HTTPException(status_code=409, detail={"message": "Account cannot be deleted yet", "reasons": reasons})
+    anonymized_email = f"deleted-{user_id}@deleted.schoolhop.local"
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE group_members
+                SET status = 'removed'
+                WHERE user_id = $1 AND status = 'active'
+                """,
+                user_id,
+            )
+            await conn.execute(
+                """
+                UPDATE children
+                SET status = 'removed',
+                    name = 'Deleted child',
+                    pickup_notes = NULL,
+                    home_address = NULL,
+                    home_city = NULL,
+                    home_postcode = NULL,
+                    home_latitude = NULL,
+                    home_longitude = NULL,
+                    home_place_id = NULL,
+                    emergency_contact_name = 'Deleted contact',
+                    emergency_contact_phone = 'deleted'
+                WHERE parent_id = $1 AND status = 'active'
+                """,
+                user_id,
+            )
+            await conn.execute("UPDATE mobile_devices SET enabled = false WHERE user_id = $1", user_id)
+            await conn.execute("UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL", user_id)
+            await conn.execute("UPDATE group_join_requests SET status = 'cancelled', updated_at = now() WHERE requester_user_id = $1 AND status = 'pending'", user_id)
+            await conn.execute(
+                """
+                UPDATE invitations
+                SET status = 'revoked'
+                WHERE email = $1 AND status = 'pending'
+                """,
+                user["email"],
+            )
+            await conn.execute(
+                """
+                UPDATE notifications
+                SET read_at = COALESCE(read_at, now())
+                WHERE user_id = $1 AND read_at IS NULL
+                """,
+                user_id,
+            )
+            await conn.execute(
+                """
+                UPDATE users
+                SET status = 'disabled',
+                    email = $2,
+                    password_hash = $3,
+                    name = 'Deleted account',
+                    phone = NULL
+                WHERE id = $1
+                """,
+                user_id,
+                anonymized_email,
+                passwords.hash(secrets.token_urlsafe(32)),
+            )
+            await conn.execute(
+                """
+                INSERT INTO audit_records (actor_user_id, action, details)
+                VALUES (NULL, 'user.deleted', $1::jsonb)
+                """,
+                json.dumps({"deleted_user_id": str(user_id)}),
+            )
+    return {"status": "deleted"}
+
+
 @app.post("/api/mobile/devices")
 async def register_mobile_device(payload: MobileDeviceIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     row = await database.fetchrow(
@@ -1571,18 +1796,23 @@ async def discover_groups(user: UserDep, database: DbDep) -> list[dict[str, Any]
 @app.post("/api/groups")
 async def create_group(payload: GroupIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     await require_no_active_group(database, user["id"])
+    normalized_name = normalize_group_name(payload.name)
     async with database.acquire() as conn:
         async with conn.transaction():
             group = await conn.fetchrow(
                 """
-                INSERT INTO carpool_groups (school_id, name, created_by)
-                VALUES ($1, $2, $3)
+                INSERT INTO carpool_groups (school_id, name, name_normalized, created_by)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (school_id, name_normalized) DO NOTHING
                 RETURNING *
                 """,
                 payload.school_id,
                 payload.name,
+                normalized_name,
                 UUID(user["id"]),
             )
+            if not group:
+                raise HTTPException(status_code=409, detail="A group with this name already exists for this school")
             await conn.execute(
                 "INSERT INTO group_members (group_id, user_id, role) VALUES ($1, $2, 'creator')",
                 group["id"],
@@ -1780,6 +2010,9 @@ async def accept_invitation(token: str, user: UserDep, database: DbDep) -> dict[
         token,
     )
     if not invitation:
+        stale = await database.fetchrow("SELECT status, expires_at FROM invitations WHERE token = $1", token)
+        if stale and stale["status"] != "pending":
+            return {"status": stale["status"]}
         raise HTTPException(status_code=404, detail="Invitation not found or expired")
     if invitation["email"].lower() != user["email"].lower():
         raise HTTPException(status_code=403, detail="Invitation email does not match this account")
@@ -1796,12 +2029,59 @@ async def accept_invitation(token: str, user: UserDep, database: DbDep) -> dict[
                 UUID(user["id"]),
             )
             await conn.execute(
-                "UPDATE invitations SET status = 'accepted', accepted_by = $1, accepted_at = now() WHERE id = $2",
+                "UPDATE invitations SET status = 'accepted', accepted_by = $1, accepted_at = now(), resolved_at = now() WHERE id = $2",
                 UUID(user["id"]),
                 invitation["id"],
             )
+            await conn.execute(
+                """
+                UPDATE invitations
+                SET status = 'revoked', resolved_at = now()
+                WHERE id <> $1
+                  AND group_id = $2
+                  AND email = $3
+                  AND status = 'pending'
+                """,
+                invitation["id"],
+                invitation["group_id"],
+                invitation["email"],
+            )
     await audit(database, user["id"], "group.invitation_accepted", invitation["group_id"])
-    return {"group_id": str(invitation["group_id"])}
+    return {"status": "accepted", "group_id": str(invitation["group_id"])}
+
+
+@app.post("/api/invitations/{token}/decline")
+async def decline_invitation(token: str, user: UserDep, database: DbDep) -> dict[str, str]:
+    invitation = await database.fetchrow("SELECT * FROM invitations WHERE token = $1", token)
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if invitation["email"].lower() != user["email"].lower():
+        raise HTTPException(status_code=403, detail="Invitation email does not match this account")
+    if invitation["status"] == "declined":
+        return {"status": "declined"}
+    if invitation["status"] == "accepted":
+        return {"status": "accepted"}
+    if invitation["status"] != "pending" or invitation["expires_at"] <= datetime.now(UTC):
+        raise HTTPException(status_code=409, detail="Invitation is no longer actionable")
+    await database.execute(
+        """
+        UPDATE invitations
+        SET status = 'declined', resolved_at = now()
+        WHERE id = $1 AND status = 'pending'
+        """,
+        invitation["id"],
+    )
+    await database.execute(
+        """
+        UPDATE notifications
+        SET read_at = COALESCE(read_at, now())
+        WHERE user_id = $1 AND entity_type = 'invitation' AND entity_id = $2 AND read_at IS NULL
+        """,
+        UUID(user["id"]),
+        invitation["id"],
+    )
+    await audit(database, user["id"], "group.invitation_declined", invitation["group_id"])
+    return {"status": "declined"}
 
 
 @app.post("/api/groups/{group_id}/leave")
@@ -1822,11 +2102,37 @@ async def leave_group(group_id: UUID, user: UserDep, database: DbDep) -> dict[st
     return {"status": "ok"}
 
 
+@app.post("/api/groups/{group_id}/transfer-ownership")
+async def transfer_group_ownership(group_id: UUID, payload: TransferGroupOwnershipIn, user: UserDep, database: DbDep) -> dict[str, str]:
+    await require_group_creator(database, user["id"], group_id)
+    if payload.new_creator_user_id == UUID(user["id"]):
+        raise HTTPException(status_code=400, detail="Choose another active group member")
+    await require_group_member(database, payload.new_creator_user_id, group_id)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("UPDATE group_members SET role = 'member' WHERE group_id = $1 AND user_id = $2", group_id, UUID(user["id"]))
+            await conn.execute("UPDATE group_members SET role = 'creator' WHERE group_id = $1 AND user_id = $2", group_id, payload.new_creator_user_id)
+            await conn.execute("UPDATE carpool_groups SET created_by = $2 WHERE id = $1", group_id, payload.new_creator_user_id)
+            await conn.execute(
+                """
+                INSERT INTO audit_records (actor_user_id, group_id, action, details)
+                VALUES ($1, $2, 'group.ownership_transferred', $3::jsonb)
+                """,
+                UUID(user["id"]),
+                group_id,
+                json.dumps({"new_creator_user_id": str(payload.new_creator_user_id)}),
+            )
+    return {"status": "ok"}
+
+
 @app.post("/api/groups/{group_id}/members/{member_user_id}/remove")
 async def remove_group_member(group_id: UUID, member_user_id: UUID, user: UserDep, database: DbDep) -> dict[str, str]:
-    await require_group_creator(database, user["id"], group_id)
+    await require_group_admin(database, user["id"], group_id)
     if member_user_id == UUID(user["id"]):
         raise HTTPException(status_code=400, detail="Use leave group to remove yourself")
+    conflicts = await active_trip_conflicts_for_member(database, group_id, member_user_id)
+    if conflicts:
+        raise HTTPException(status_code=409, detail="Reassign this member's active or future driving assignments before removal")
     row = await database.fetchrow(
         """
         UPDATE group_members
@@ -1839,6 +2145,34 @@ async def remove_group_member(group_id: UUID, member_user_id: UUID, user: UserDe
     )
     if not row:
         raise HTTPException(status_code=404, detail="Active group member not found")
+    await database.execute(
+        """
+        UPDATE invitations
+        SET status = 'revoked', resolved_at = COALESCE(resolved_at, now())
+        WHERE group_id = $1
+          AND status = 'pending'
+          AND email = (SELECT email FROM users WHERE id = $2)
+        """,
+        group_id,
+        member_user_id,
+    )
+    await database.execute(
+        """
+        UPDATE group_join_requests
+        SET status = 'cancelled', updated_at = now()
+        WHERE group_id = $1 AND requester_user_id = $2 AND status = 'pending'
+        """,
+        group_id,
+        member_user_id,
+    )
+    await database.execute(
+        """
+        UPDATE notifications
+        SET read_at = COALESCE(read_at, now())
+        WHERE user_id = $1 AND entity_type IN ('group', 'trip', 'invitation') AND read_at IS NULL
+        """,
+        member_user_id,
+    )
     await notify(database, member_user_id, "group_removed", "Removed from SchoolHop group", "You were removed from a SchoolHop carpool group.", "group", group_id, email=True, action_url="/?tab=group")
     await audit(database, user["id"], "group.member_removed", group_id, details={"member_user_id": str(member_user_id)})
     return {"status": "ok"}
@@ -1864,10 +2198,10 @@ async def create_child(payload: ChildIn, user: UserDep, database: DbDep) -> dict
         """
         INSERT INTO children (
             parent_id, school_id, name, year_group, pickup_notes,
-            home_address, home_city, home_country, home_latitude, home_longitude, home_place_id,
+            home_address, home_city, home_postcode, home_country, home_latitude, home_longitude, home_place_id,
             emergency_contact_name, emergency_contact_phone
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING *
         """,
         UUID(user["id"]),
@@ -1877,6 +2211,7 @@ async def create_child(payload: ChildIn, user: UserDep, database: DbDep) -> dict
         payload.pickup_notes,
         payload.home_address,
         payload.home_city,
+        payload.home_postcode,
         payload.home_country,
         payload.home_latitude,
         payload.home_longitude,
@@ -1899,13 +2234,14 @@ async def update_child(child_id: UUID, payload: ChildIn, user: UserDep, database
             pickup_notes = $4,
             home_address = $5,
             home_city = $6,
-            home_country = $7,
-            home_latitude = $8,
-            home_longitude = $9,
-            home_place_id = $10,
-            emergency_contact_name = $11,
-            emergency_contact_phone = $12
-        WHERE id = $13 AND parent_id = $14 AND status = 'active'
+            home_postcode = $7,
+            home_country = $8,
+            home_latitude = $9,
+            home_longitude = $10,
+            home_place_id = $11,
+            emergency_contact_name = $12,
+            emergency_contact_phone = $13
+        WHERE id = $14 AND parent_id = $15 AND status = 'active'
         RETURNING *
         """,
         payload.school_id,
@@ -1914,6 +2250,7 @@ async def update_child(child_id: UUID, payload: ChildIn, user: UserDep, database
         payload.pickup_notes,
         payload.home_address,
         payload.home_city,
+        payload.home_postcode,
         payload.home_country,
         payload.home_latitude,
         payload.home_longitude,
@@ -2048,6 +2385,9 @@ async def create_trip(group_id: UUID, payload: TripIn, user: UserDep, database: 
                 """
                 INSERT INTO trips (group_id, driver_user_id, service_date, trip_type, expected_time, created_by)
                 VALUES ($1, $2, $3, $4, $5::time, $6)
+                ON CONFLICT (group_id, service_date, trip_type, expected_time)
+                    WHERE status IN ('planned', 'started', 'delayed')
+                DO NOTHING
                 RETURNING *
                 """,
                 group_id,
@@ -2057,8 +2397,45 @@ async def create_trip(group_id: UUID, payload: TripIn, user: UserDep, database: 
                 payload.expected_time,
                 UUID(user["id"]),
             )
-            for child_id in payload.child_ids:
-                await conn.execute("INSERT INTO trip_children (trip_id, child_id) VALUES ($1, $2)", trip["id"], child_id)
+            created = bool(trip)
+            if created:
+                for child_id in payload.child_ids:
+                    await conn.execute("INSERT INTO trip_children (trip_id, child_id) VALUES ($1, $2)", trip["id"], child_id)
+            else:
+                trip = await conn.fetchrow(
+                    """
+                    SELECT *
+                    FROM trips
+                    WHERE group_id = $1
+                      AND service_date = $2
+                      AND trip_type = $3
+                      AND expected_time = $4::time
+                      AND status IN ('planned', 'started', 'delayed')
+                    ORDER BY created_at
+                    LIMIT 1
+                    """,
+                    group_id,
+                    payload.service_date,
+                    payload.trip_type,
+                    payload.expected_time,
+                )
+                if not trip:
+                    raise HTTPException(status_code=409, detail="A roster already exists for this scheduled time")
+                existing_child_ids = set(
+                    await conn.fetchval(
+                        """
+                        SELECT coalesce(array_agg(child_id ORDER BY child_id), '{}'::uuid[])
+                        FROM trip_children
+                        WHERE trip_id = $1
+                        """,
+                        trip["id"],
+                    )
+                    or []
+                )
+                if trip["driver_user_id"] != payload.driver_user_id or existing_child_ids != set(payload.child_ids):
+                    raise HTTPException(status_code=409, detail="A different roster already exists for this scheduled time")
+    if not created:
+        return await serialize_trip(database, user["id"], trip)
     participant_ids = {payload.driver_user_id}
     participant_ids.update(child["parent_id"] for child in child_rows)
     for participant_id in participant_ids:
@@ -2091,6 +2468,63 @@ async def create_trip(group_id: UUID, payload: TripIn, user: UserDep, database: 
             )
     await audit(database, user["id"], "trip.created", group_id, trip["id"], {"child_ids": [str(x) for x in payload.child_ids]})
     return await serialize_trip(database, user["id"], trip)
+
+
+@app.post("/api/trips/{trip_id}/reassign-driver")
+async def reassign_trip_driver(trip_id: UUID, payload: ReassignTripDriverIn, user: UserDep, database: DbDep) -> dict[str, Any]:
+    trip = await trip_with_permission(database, user["id"], trip_id)
+    await require_group_admin(database, user["id"], trip["group_id"])
+    if trip["status"] not in {"planned", "delayed", "driver_unavailable"} or trip["service_date"] < date.today():
+        raise HTTPException(status_code=409, detail="Only active or future unstarted rosters can be reassigned")
+    if payload.driver_user_id == trip["driver_user_id"]:
+        return await serialize_trip(database, user["id"], trip)
+    await assert_driver_approved_for_trip(database, trip["group_id"], trip_id, payload.driver_user_id)
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            updated = await conn.fetchrow(
+                "UPDATE trips SET driver_user_id = $2 WHERE id = $1 RETURNING *",
+                trip_id,
+                payload.driver_user_id,
+            )
+            await conn.execute(
+                """
+                UPDATE roster_change_requests
+                SET status = 'cancelled'
+                WHERE trip_id = $1 AND status = 'open'
+                """,
+                trip_id,
+            )
+            await conn.execute(
+                """
+                DELETE FROM trip_responses
+                WHERE trip_id = $1 AND user_id <> $2
+                """,
+                trip_id,
+                payload.driver_user_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO audit_records (actor_user_id, group_id, trip_id, action, details)
+                VALUES ($1, $2, $3, 'trip.driver_reassigned', $4::jsonb)
+                """,
+                UUID(user["id"]),
+                trip["group_id"],
+                trip_id,
+                json.dumps({"old_driver_user_id": str(trip["driver_user_id"]), "new_driver_user_id": str(payload.driver_user_id)}),
+            )
+    await notify(
+        database,
+        payload.driver_user_id,
+        "driver_assignment",
+        "SchoolHop driver assignment",
+        "You were assigned to drive a carpool trip. Please accept or decline the assignment.",
+        "trip",
+        trip_id,
+        email=True,
+        idempotency_key=f"driver_reassignment:{trip_id}:{payload.driver_user_id}",
+        action_url=f"/?tab=trip&trip={trip_id}",
+    )
+    return await serialize_trip(database, user["id"], updated)
 
 
 @app.get("/api/groups/{group_id}/trips")
@@ -2139,7 +2573,8 @@ async def list_trip_history(group_id: UUID, user: UserDep, database: DbDep) -> l
         LEFT JOIN trip_children tc ON tc.trip_id = t.id
         LEFT JOIN children c ON c.id = tc.child_id
         WHERE t.group_id = $1
-          AND (t.service_date < CURRENT_DATE OR t.status IN ('completed', 'cancelled', 'driver_unavailable', 'ignored'))
+          AND t.status <> 'ignored'
+          AND (t.service_date < CURRENT_DATE OR t.status IN ('completed', 'cancelled', 'driver_unavailable'))
           AND (t.driver_user_id = $2 OR c.parent_id = $2 OR t.created_by = $2)
         ORDER BY t.service_date DESC, t.expected_time DESC
         LIMIT 200

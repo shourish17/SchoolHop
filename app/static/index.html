@@ -87,6 +87,7 @@
           <button data-tab="roster" type="button">Roster</button>
           <button data-tab="trip" type="button">Trip</button>
           <button data-tab="alerts" type="button">Alerts</button>
+          <button data-tab="account" type="button">Account</button>
         </nav>
 
         <section id="home" class="tab active">
@@ -151,6 +152,7 @@
             <form id="acceptInviteForm" class="inline-form">
               <input name="token" placeholder="Invitation token" required />
               <button type="submit">Join</button>
+              <button id="declineInvite" class="ghost danger" type="button">Decline</button>
             </form>
             <form id="requestAccessForm" class="inline-form">
               <select id="requestSchool" name="school_id" required></select>
@@ -258,7 +260,7 @@
             <input name="year_group" placeholder="Year group" required />
             <input name="home_address" placeholder="Home street address for pickup/drop-off" />
             <input name="home_city" placeholder="Home city" />
-            <input name="home_country" placeholder="Home country code" value="DE" maxlength="2" />
+            <input name="home_postcode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" placeholder="Postcode" required />
             <textarea name="pickup_notes" placeholder="Pickup/drop-off notes"></textarea>
             <input name="emergency_contact_name" placeholder="Emergency contact name" required />
             <input name="emergency_contact_phone" placeholder="Emergency contact phone" required />
@@ -282,10 +284,18 @@
             <div id="notificationList" class="card-list"></div>
           </section>
         </section>
+
+        <section id="account" class="tab">
+          <section class="panel">
+            <h2>Account Settings</h2>
+            <p id="accountEmail"></p>
+            <button id="deleteAccount" class="danger" type="button">Delete Account</button>
+          </section>
+        </section>
       </section>
     </main>
 
     <div id="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js?v=25"></script>
+    <script src="/static/app.js?v=26"></script>
   </body>
 </html>
