@@ -598,9 +598,22 @@ async def require_group_creator(database: asyncpg.Pool, user_id: UUID | str, gro
 
 async def require_group_admin(database: asyncpg.Pool, user_id: UUID | str, group_id: UUID | str) -> asyncpg.Record:
     member = await require_group_member(database, user_id, group_id)
-    if member["role"] != "creator":
+    if member["role"] not in {"creator", "admin"}:
         raise HTTPException(status_code=403, detail="Group admin permission required")
     return member
+
+
+async def is_group_admin(database: asyncpg.Pool, user_id: UUID | str, group_id: UUID | str) -> bool:
+    member = await database.fetchrow(
+        """
+        SELECT role
+        FROM group_members
+        WHERE group_id = $1 AND user_id = $2 AND status = 'active'
+        """,
+        UUID(str(group_id)),
+        UUID(str(user_id)),
+    )
+    return bool(member and member["role"] in {"creator", "admin"})
 
 
 async def require_group_member(database: asyncpg.Pool, user_id: UUID | str, group_id: UUID | str) -> asyncpg.Record:
@@ -766,6 +779,67 @@ async def require_trip_driver(database: asyncpg.Pool, user_id: UUID | str, trip_
     if trip["driver_user_id"] != UUID(str(user_id)):
         raise HTTPException(status_code=403, detail="Assigned driver required")
     return trip
+
+
+async def trip_child_ids(database: asyncpg.Pool, trip_id: UUID | str) -> list[UUID]:
+    rows = await database.fetch(
+        "SELECT child_id FROM trip_children WHERE trip_id = $1 ORDER BY child_id",
+        UUID(str(trip_id)),
+    )
+    return [row["child_id"] for row in rows]
+
+
+async def lock_trip_start_scope(conn: Any, driver_user_id: UUID | str, child_ids: list[UUID]) -> None:
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 1101))",
+        str(driver_user_id),
+    )
+    if child_ids:
+        await conn.fetch(
+            """
+            SELECT id
+            FROM children
+            WHERE id = ANY($1::uuid[])
+            ORDER BY id
+            FOR UPDATE
+            """,
+            child_ids,
+        )
+
+
+async def active_driver_trip_conflict(conn: Any, driver_user_id: UUID | str, trip_id: UUID | str) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT id
+        FROM trips
+        WHERE driver_user_id = $1
+          AND id <> $2
+          AND status = 'started'
+          AND ended_at IS NULL
+        LIMIT 1
+        """,
+        UUID(str(driver_user_id)),
+        UUID(str(trip_id)),
+    )
+
+
+async def active_child_trip_conflict(conn: Any, child_ids: list[UUID], trip_id: UUID | str) -> asyncpg.Record | None:
+    if not child_ids:
+        return None
+    return await conn.fetchrow(
+        """
+        SELECT t.id, t.group_id
+        FROM trips t
+        JOIN trip_children tc ON tc.trip_id = t.id
+        WHERE tc.child_id = ANY($1::uuid[])
+          AND t.id <> $2
+          AND t.status = 'started'
+          AND t.ended_at IS NULL
+        LIMIT 1
+        """,
+        child_ids,
+        UUID(str(trip_id)),
+    )
 
 
 def trip_label(trip: asyncpg.Record | dict[str, Any]) -> str:
@@ -1130,6 +1204,7 @@ async def compute_google_route(
 
 async def serialize_trip(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> dict[str, Any]:
     payload = row_to_dict(trip) or {}
+    payload["can_admin_end_trip"] = await is_group_admin(database, user_id, trip["group_id"])
     driver = await database.fetchrow("SELECT id, name, email, phone FROM users WHERE id = $1", trip["driver_user_id"])
     payload["driver"] = row_to_dict(driver)
     payload["children"] = await visible_trip_children(database, user_id, trip)
@@ -1165,9 +1240,21 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
     driver_ids = list({trip["driver_user_id"] for trip in trips})
     now = datetime.now(UTC)
 
-    driver_rows, group_creator_rows, swap_rows, child_rows, response_rows, location_rows = await asyncio.gather(
+    driver_rows, group_creator_rows, group_admin_rows, swap_rows, child_rows, response_rows, location_rows = await asyncio.gather(
         database.fetch("SELECT id, name, email, phone FROM users WHERE id = ANY($1::uuid[])", driver_ids),
         database.fetch("SELECT id, created_by FROM carpool_groups WHERE id = ANY($1::uuid[])", group_ids),
+        database.fetch(
+            """
+            SELECT group_id
+            FROM group_members
+            WHERE group_id = ANY($1::uuid[])
+              AND user_id = $2
+              AND status = 'active'
+              AND role IN ('creator', 'admin')
+            """,
+            group_ids,
+            user_uuid,
+        ),
         database.fetch(
             """
             SELECT trip_id
@@ -1208,6 +1295,7 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
 
     drivers = {row["id"]: row_to_dict(row) for row in driver_rows}
     group_creators = {row["id"]: row["created_by"] for row in group_creator_rows}
+    group_admin_ids = {row["group_id"] for row in group_admin_rows}
     proposed_swap_trip_ids = {row["trip_id"] for row in swap_rows}
     responses = {row["trip_id"]: row_to_dict(row) for row in response_rows}
     locations: dict[UUID, dict[str, Any] | None] = {}
@@ -1226,7 +1314,8 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
     payloads: list[dict[str, Any]] = []
     for trip in trips:
         is_driver = trip["driver_user_id"] == user_uuid
-        can_view_all = is_driver or group_creators.get(trip["group_id"]) == user_uuid or trip["id"] in proposed_swap_trip_ids
+        can_admin = trip["group_id"] in group_admin_ids or group_creators.get(trip["group_id"]) == user_uuid
+        can_view_all = is_driver or can_admin or trip["id"] in proposed_swap_trip_ids
         children: list[dict[str, Any]] = []
         for child in children_by_trip.get(trip["id"], []):
             if not can_view_all and child.get("parent_id") != str(user_uuid):
@@ -1247,6 +1336,7 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
         payload["children"] = children
         payload["my_response"] = responses.get(trip["id"])
         payload["latest_location"] = locations.get(trip["id"])
+        payload["can_admin_end_trip"] = can_admin
         payloads.append(payload)
     return payloads
 
@@ -2547,6 +2637,14 @@ async def list_trips(group_id: UUID, user: UserDep, database: DbDep, from_date: 
               OR t.created_by = $4
               OR EXISTS (
                   SELECT 1
+                  FROM group_members gm_admin
+                  WHERE gm_admin.group_id = t.group_id
+                    AND gm_admin.user_id = $4
+                    AND gm_admin.status = 'active'
+                    AND gm_admin.role IN ('creator', 'admin')
+              )
+              OR EXISTS (
+                  SELECT 1
                   FROM roster_change_requests rcr
                   WHERE rcr.trip_id = t.id
                     AND rcr.proposed_driver_user_id = $4
@@ -2575,7 +2673,19 @@ async def list_trip_history(group_id: UUID, user: UserDep, database: DbDep) -> l
         WHERE t.group_id = $1
           AND t.status <> 'ignored'
           AND (t.service_date < CURRENT_DATE OR t.status IN ('completed', 'cancelled', 'driver_unavailable'))
-          AND (t.driver_user_id = $2 OR c.parent_id = $2 OR t.created_by = $2)
+          AND (
+              t.driver_user_id = $2
+              OR c.parent_id = $2
+              OR t.created_by = $2
+              OR EXISTS (
+                  SELECT 1
+                  FROM group_members gm_admin
+                  WHERE gm_admin.group_id = t.group_id
+                    AND gm_admin.user_id = $2
+                    AND gm_admin.status = 'active'
+                    AND gm_admin.role IN ('creator', 'admin')
+              )
+          )
         ORDER BY t.service_date DESC, t.expected_time DESC
         LIMIT 200
         """,
@@ -2916,19 +3026,43 @@ async def start_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
     )
     if not accepted:
         raise HTTPException(status_code=409, detail="Accept this trip before starting it")
-    updated = await database.fetchrow(
-        """
-        UPDATE trips
-        SET status = 'started',
-            started_at = now(),
-            ended_at = NULL,
-            safety_timeout_at = now() + ($2::text || ' minutes')::interval
-        WHERE id = $1
-        RETURNING *
-        """,
-        trip_id,
-        str(settings.safety_timeout_minutes),
-    )
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            locked_trip = await conn.fetchrow("SELECT * FROM trips WHERE id = $1 FOR UPDATE", trip_id)
+            if not locked_trip:
+                raise HTTPException(status_code=404, detail="Trip not found")
+            if locked_trip["driver_user_id"] != UUID(user["id"]):
+                raise HTTPException(status_code=403, detail="Assigned driver required")
+            if locked_trip["status"] not in {"planned", "delayed"}:
+                raise HTTPException(status_code=409, detail="Trip cannot be started from its current status")
+            if locked_trip["service_date"] != date.today():
+                raise HTTPException(status_code=409, detail="Trip can only be started on its service date")
+            child_ids = await trip_child_ids(conn, trip_id)
+            await lock_trip_start_scope(conn, locked_trip["driver_user_id"], child_ids)
+            if await active_driver_trip_conflict(conn, locked_trip["driver_user_id"], trip_id):
+                raise HTTPException(status_code=409, detail="This driver already has an active trip. Complete the earlier trip before starting another.")
+            if await active_child_trip_conflict(conn, child_ids, trip_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot start this trip. One or more children are already assigned to another active trip. Please complete the earlier trip or contact your group admin.",
+                )
+            updated = await conn.fetchrow(
+                """
+                UPDATE trips
+                SET status = 'started',
+                    started_at = now(),
+                    ended_at = NULL,
+                    ended_by_user_id = NULL,
+                    end_reason = NULL,
+                    safety_timeout_at = now() + ($2::text || ' minutes')::interval
+                WHERE id = $1 AND status IN ('planned', 'delayed')
+                RETURNING *
+                """,
+                trip_id,
+                str(settings.safety_timeout_minutes),
+            )
+            if not updated:
+                raise HTTPException(status_code=409, detail="Trip cannot be started from its current status")
     parent_ids = await database.fetch(
         "SELECT DISTINCT c.parent_id FROM trip_children tc JOIN children c ON c.id = tc.child_id WHERE tc.trip_id = $1",
         trip_id,
@@ -2952,29 +3086,96 @@ async def start_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
 
 @app.post("/api/trips/{trip_id}/end")
 async def end_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str, Any]:
-    trip = await require_trip_driver(database, user["id"], trip_id)
-    updated = await database.fetchrow(
-        "UPDATE trips SET status = 'completed', ended_at = now() WHERE id = $1 RETURNING *",
-        trip_id,
-    )
+    trip = await trip_with_permission(database, user["id"], trip_id)
+    user_id = UUID(user["id"])
+    is_driver_end = trip["driver_user_id"] == user_id
+    if not is_driver_end:
+        await require_group_admin(database, user_id, trip["group_id"])
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            locked_trip = await conn.fetchrow("SELECT * FROM trips WHERE id = $1 FOR UPDATE", trip_id)
+            if not locked_trip:
+                raise HTTPException(status_code=404, detail="Trip not found")
+            if locked_trip["driver_user_id"] != user_id and not await is_group_admin(conn, user_id, locked_trip["group_id"]):
+                raise HTTPException(status_code=403, detail="Group admin permission required")
+            if locked_trip["status"] != "started" or locked_trip["ended_at"] is not None:
+                if locked_trip["status"] == "completed" and locked_trip["ended_at"] is not None:
+                    return await serialize_trip(database, user["id"], locked_trip)
+                raise HTTPException(status_code=409, detail="Only active trips can be ended")
+            reason = "driver_ended" if locked_trip["driver_user_id"] == user_id else "admin_ended"
+            updated = await conn.fetchrow(
+                """
+                UPDATE trips
+                SET status = 'completed',
+                    ended_at = now(),
+                    ended_by_user_id = $2,
+                    end_reason = $3
+                WHERE id = $1 AND status = 'started' AND ended_at IS NULL
+                RETURNING *
+                """,
+                trip_id,
+                user_id,
+                reason,
+            )
+            if not updated:
+                raise HTTPException(status_code=409, detail="Trip already ended")
+            await conn.execute(
+                """
+                INSERT INTO audit_records (actor_user_id, group_id, trip_id, action, details)
+                VALUES ($1, $2, $3, $4, $5::jsonb)
+                """,
+                user_id,
+                locked_trip["group_id"],
+                trip_id,
+                "trip.admin_ended" if reason == "admin_ended" else "trip.ended",
+                json.dumps(
+                    {
+                        "trip_id": str(trip_id),
+                        "original_driver_id": str(locked_trip["driver_user_id"]),
+                        "admin_id": str(user_id) if reason == "admin_ended" else None,
+                        "reason": reason,
+                    }
+                ),
+            )
     parent_ids = await database.fetch(
         "SELECT DISTINCT c.parent_id FROM trip_children tc JOIN children c ON c.id = tc.child_id WHERE tc.trip_id = $1",
         trip_id,
     )
+    updated_payload = row_to_dict(updated) or {}
+    admin_ended = updated_payload.get("end_reason") == "admin_ended"
+    kind = "trip_admin_end" if admin_ended else "trip_end"
+    title = "Trip ended by admin" if admin_ended else "Trip ended"
+    body = (
+        f"A group admin ended {trip_label(updated)}. Location sharing has stopped."
+        if admin_ended
+        else f"Location sharing has stopped for {trip_label(updated)}."
+    )
+    if admin_ended:
+        await notify(
+            database,
+            updated["driver_user_id"],
+            kind,
+            title,
+            body,
+            "trip",
+            trip_id,
+            email=False,
+            idempotency_key=f"trip_admin_end:{trip_id}:driver:{updated['driver_user_id']}",
+            action_url=f"/?tab=trip&trip={trip_id}",
+        )
     for parent in parent_ids:
         await notify(
             database,
             parent["parent_id"],
-            "trip_end",
-            "Trip ended",
-            f"Location sharing has stopped for {trip_label(updated)}.",
+            kind,
+            title,
+            body,
             "trip",
             trip_id,
-            email=True,
-            idempotency_key=f"trip_end:{trip_id}:{parent['parent_id']}",
+            email=False,
+            idempotency_key=f"{kind}:{trip_id}:{parent['parent_id']}",
             action_url=f"/?tab=trip&trip={trip_id}",
         )
-    await audit(database, user["id"], "trip.ended", trip["group_id"], trip_id)
     return await serialize_trip(database, user["id"], updated)
 
 

@@ -133,6 +133,16 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ON trips (group_id, service_date, trip_type, expected_time)", migration)
         self.assertIn("RAISE EXCEPTION 'Duplicate active/future roster timestamps exist", migration)
 
+    def test_migration_adds_admin_end_audit_and_active_trip_indexes(self):
+        migration = Path("migrations/011_trip_admin_end_and_active_conflicts.sql").read_text()
+
+        self.assertIn("ended_by_user_id", migration)
+        self.assertIn("end_reason", migration)
+        self.assertIn("admin_ended", migration)
+        self.assertIn("'admin'", migration)
+        self.assertIn("trips_active_driver_idx", migration)
+        self.assertIn("trips_active_child_idx", migration)
+
     async def test_account_deletion_blocks_active_future_driver_assignments(self):
         database = AccountDeletionPolicyDatabase(active_driver_assignments=1)
 
@@ -757,6 +767,83 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
 
+    async def test_start_trip_blocks_same_driver_active_conflict(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.response_status = "accepted"
+        database.active_driver_conflict = uuid4()
+
+        with self.assertRaises(HTTPException) as raised:
+            await main.start_trip(ids.trip_id, {"id": str(ids.driver_id), "name": "Driver"}, database)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("driver already has an active trip", raised.exception.detail)
+
+    async def test_start_trip_blocks_active_child_conflict_without_private_details(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.response_status = "accepted"
+        database.active_child_conflict = uuid4()
+
+        with self.assertRaises(HTTPException) as raised:
+            await main.start_trip(ids.trip_id, {"id": str(ids.driver_id), "name": "Driver"}, database)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail,
+            "Cannot start this trip. One or more children are already assigned to another active trip. Please complete the earlier trip or contact your group admin.",
+        )
+        self.assertNotIn("Child", raised.exception.detail)
+        self.assertNotIn("Driver", raised.exception.detail)
+
+    async def test_start_trip_allows_after_admin_ended_conflict(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.response_status = "accepted"
+
+        row = await main.start_trip(ids.trip_id, {"id": str(ids.driver_id), "name": "Driver"}, database)
+
+        self.assertEqual(row["status"], "started")
+        self.assertIn(("trip.started", ids.trip_id), database.audit_actions)
+
+    async def test_group_creator_can_admin_end_active_trip_without_completing_handovers(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.trip = Record({**database.trip, "status": "started", "started_at": datetime.now(UTC)})
+        user = {"id": str(ids.organiser_id), "name": "Organiser"}
+
+        row = await main.end_trip(ids.trip_id, user, database)
+
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["end_reason"], "admin_ended")
+        self.assertEqual(database.handover_updates, 0)
+        notified = {(row["user_id"], row["kind"]) for row in database.notifications}
+        self.assertIn((ids.driver_id, "trip_admin_end"), notified)
+        self.assertIn((ids.parent_id, "trip_admin_end"), notified)
+        self.assertIn(("trip.admin_ended", ids.trip_id), database.audit_actions)
+
+    async def test_member_cannot_end_another_drivers_trip(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.trip = Record({**database.trip, "status": "started", "started_at": datetime.now(UTC)})
+
+        with self.assertRaises(HTTPException) as raised:
+            await main.end_trip(ids.trip_id, {"id": str(ids.proposed_driver_id), "name": "Member"}, database)
+
+        self.assertEqual(raised.exception.status_code, 403)
+
+    async def test_repeated_admin_end_is_idempotent_without_duplicate_notifications(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.trip = Record({**database.trip, "status": "started", "started_at": datetime.now(UTC)})
+        user = {"id": str(ids.organiser_id), "name": "Organiser"}
+
+        await main.end_trip(ids.trip_id, user, database)
+        await main.end_trip(ids.trip_id, user, database)
+
+        self.assertEqual(len([row for row in database.notifications if row["kind"] == "trip_admin_end"]), 2)
+        self.assertEqual(len([action for action in database.audit_actions if action == ("trip.admin_ended", ids.trip_id)]), 1)
+
     async def test_api_prevents_declined_assignment_from_accept(self):
         ids = ActionIds()
         database = TripActionDatabase(ids)
@@ -1319,6 +1406,9 @@ class TripActionDatabase:
         self.audit_actions = []
         self.open_swap_exists = False
         self.response_status = None
+        self.active_driver_conflict = None
+        self.active_child_conflict = None
+        self.handover_updates = 0
         self.trip = Record(
             {
                 "id": ids.trip_id,
@@ -1333,6 +1423,8 @@ class TripActionDatabase:
                 "cancellation_reason": None,
                 "started_at": None,
                 "ended_at": None,
+                "ended_by_user_id": None,
+                "end_reason": None,
                 "safety_timeout_at": None,
                 "created_by": ids.organiser_id,
                 "created_at": None,
@@ -1349,9 +1441,45 @@ class TripActionDatabase:
         if "SELECT * FROM trips WHERE id" in query:
             return self.trip
         if "FROM group_members" in query:
-            return Record({"group_id": self.ids.group_id, "user_id": args[1], "role": "member", "status": "active"})
+            role = "creator" if args[1] == self.ids.organiser_id else "member"
+            if args[1] == self.ids.unrelated_id:
+                return None
+            return Record({"group_id": self.ids.group_id, "user_id": args[1], "role": role, "status": "active"})
+        if "WHERE driver_user_id = $1" in query and "status = 'started'" in query:
+            if self.active_driver_conflict:
+                return Record({"id": self.active_driver_conflict})
+            return None
+        if "JOIN trip_children tc ON tc.trip_id = t.id" in query and "status = 'started'" in query:
+            if self.active_child_conflict:
+                return Record({"id": self.active_child_conflict, "group_id": self.ids.group_id})
+            return None
         if "UPDATE trips SET status = 'delayed'" in query:
             self.trip = Record({**self.trip, "status": "delayed", "delay_minutes": args[1], "delay_note": args[2]})
+            return self.trip
+        if "UPDATE trips" in query and "status = 'completed'" in query:
+            if self.trip["status"] != "started" or self.trip["ended_at"] is not None:
+                return None
+            self.trip = Record(
+                {
+                    **self.trip,
+                    "status": "completed",
+                    "ended_at": datetime.now(UTC),
+                    "ended_by_user_id": args[1],
+                    "end_reason": args[2],
+                }
+            )
+            return self.trip
+        if "UPDATE trips" in query and "status = 'started'" in query:
+            self.trip = Record(
+                {
+                    **self.trip,
+                    "status": "started",
+                    "started_at": datetime.now(UTC),
+                    "ended_at": None,
+                    "ended_by_user_id": None,
+                    "end_reason": None,
+                }
+            )
             return self.trip
         if "INSERT INTO notifications" in query:
             key = args[6]
@@ -1412,6 +1540,8 @@ class TripActionDatabase:
     async def fetchval(self, query, *args):
         if "SELECT created_by FROM carpool_groups" in query:
             return self.ids.organiser_id
+        if "FROM trip_responses" in query:
+            return 1 if self.response_status == "accepted" else None
         if "LEFT JOIN driver_approvals" in query:
             return None
         if "FROM roster_change_requests" in query:
@@ -1425,7 +1555,11 @@ class TripActionDatabase:
     async def fetch(self, query, *args):
         if "mobile_devices" in query:
             return []
-        if "SELECT DISTINCT c.parent_id, c.name AS child_name" in query:
+        if "SELECT child_id FROM trip_children" in query:
+            return [Record({"child_id": self.ids.child_id})]
+        if "FROM children" in query and "FOR UPDATE" in query:
+            return [Record({"id": child_id}) for child_id in args[0]]
+        if "SELECT DISTINCT c.parent_id" in query:
             return [
                 Record({"parent_id": self.ids.parent_id, "child_name": "Child"}),
             ]
@@ -1456,10 +1590,13 @@ class TripActionDatabase:
         raise AssertionError(query)
 
     async def execute(self, query, *args):
+        if "pg_advisory_xact_lock" in query:
+            return None
         if "INSERT INTO audit_records" in query:
             self.audit_actions.append((args[3], args[2]))
             return None
         if "UPDATE trip_children SET" in query:
+            self.handover_updates += 1
             return None
         raise AssertionError(query)
 
@@ -1771,6 +1908,8 @@ class TripListDatabase:
             return [self.driver]
         if "FROM carpool_groups WHERE id = ANY" in query:
             return [Record({"id": self.group_id, "created_by": self.user_id})]
+        if "SELECT group_id" in query and "FROM group_members" in query:
+            return [Record({"group_id": self.group_id})]
         if "FROM trip_children" in query and "JOIN children" in query:
             return []
         if "FROM trip_responses" in query:

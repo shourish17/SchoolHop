@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=26/);
-  assert.match(worker, /schoolhop-shell-v26/);
-  assert.match(worker, /\/static\/app\.js\?v=26/);
+  assert.match(html, /\/static\/app\.js\?v=27/);
+  assert.match(worker, /schoolhop-shell-v27/);
+  assert.match(worker, /\/static\/app\.js\?v=27/);
 });
 
 test("registration UI uses verified account creation flow", async () => {
@@ -96,6 +96,20 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   assert.match(app, /target\.closest\("\.trip-card\[data-tracking='on'\]"\)/);
 });
 
+test("trip and roster selections survive refresh rebuilds", async () => {
+  const app = await read("app/static/app.js");
+
+  assert.match(app, /sessionStorage\.getItem\("schoolhop_selected_trip"\)/);
+  assert.match(app, /function rememberSelectedTrip/);
+  assert.match(app, /requestId === state\.selectedTripActionsRequestId && state\.selectedTripId === tripId/);
+  assert.doesNotMatch(app, /state\.selectedTripId = trips\[0\]\.id/);
+  assert.match(app, /sessionStorage\.getItem\("schoolhop_selected_roster_driver"\)/);
+  assert.match(app, /function rememberRosterDriver/);
+  assert.match(app, /Choose a driver for this roster/);
+  assert.match(app, /The selected driver is no longer available/);
+  assert.match(app, /trip\.driver_user_id && trip\.driver_user_id !== data\.driver_user_id/);
+});
+
 test("account deletion and Australian postcode controls are present", async () => {
   const html = await read("app/static/index.html");
   const app = await read("app/static/app.js");
@@ -130,7 +144,7 @@ test("home screen orders pending actions, current trip, next trip, and upcoming 
   assert.match(app, /state\.pendingActions = pendingActions/);
   assert.match(app, /\$\("pendingActionPanel"\)\.classList\.toggle\("hidden", !state\.pendingActions\.length\)/);
   assert.match(app, /const currentTrip = startedTrips\[0\] \|\| null/);
-  assert.match(app, /const startedTrip = trips\.find\(\(trip\) => trip\.status === "started"\)/);
+  assert.match(app, /const currentTrip = startedTrips\[0\] \|\| null/);
   assert.match(app, /const nextTrip = upcomingTrips\[0\] \|\| null/);
 });
 

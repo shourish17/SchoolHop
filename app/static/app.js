@@ -17,7 +17,12 @@ const state = {
   changeRequests: [],
   historyLoaded: false,
   historyLoading: false,
-  selectedTripId: localStorage.getItem("schoolhop_selected_trip"),
+  selectedTripId: sessionStorage.getItem("schoolhop_selected_trip"),
+  selectedTripFallbackNotified: null,
+  selectedTripActionsRequestId: 0,
+  selectedRosterDriverId: sessionStorage.getItem("schoolhop_selected_roster_driver"),
+  rosterDriverWarningId: null,
+  refreshGroupRequestId: 0,
   pendingTab: null,
   pendingSwapRequestId: null,
   showTripHistory: false,
@@ -128,6 +133,25 @@ function fillSelect(select, rows, label, value = "id") {
     : `<option value="">None available</option>`;
 }
 
+function fillSelectWithPlaceholder(select, rows, label, placeholder, value = "id") {
+  if (!select) return;
+  select.innerHTML = `<option value="">${escapeHTML(placeholder)}</option>${
+    rows.map((row) => `<option value="${escapeHTML(row[value])}">${escapeHTML(label(row))}</option>`).join("")
+  }`;
+}
+
+function rememberSelectedTrip(tripId) {
+  state.selectedTripId = tripId || null;
+  if (state.selectedTripId) sessionStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+  else sessionStorage.removeItem("schoolhop_selected_trip");
+}
+
+function rememberRosterDriver(driverId) {
+  state.selectedRosterDriverId = driverId || null;
+  if (state.selectedRosterDriverId) sessionStorage.setItem("schoolhop_selected_roster_driver", state.selectedRosterDriverId);
+  else sessionStorage.removeItem("schoolhop_selected_roster_driver");
+}
+
 function selectedGroupId() {
   const groupSelect = $("groupSelect");
   return (groupSelect && groupSelect.value) || (state.groups[0] && state.groups[0].id) || "";
@@ -137,7 +161,7 @@ function selectedTrip() {
   const activeTrip = $("activeTrip");
   const activeTripId = activeTrip ? activeTrip.value : "";
   const trips = activeTrips();
-  return trips.find((trip) => trip.id === activeTripId) || trips.find((trip) => trip.id === state.selectedTripId) || trips[0] || null;
+  return trips.find((trip) => trip.id === activeTripId) || trips.find((trip) => trip.id === state.selectedTripId) || null;
 }
 
 function isDriver(trip) {
@@ -210,6 +234,15 @@ function canDeleteRoster(trip) {
   if (!trip || trip.status !== "planned" || !state.me) return false;
   const groupCreatorId = state.group && state.group.group && state.group.group.created_by;
   return trip.created_by === state.me.id || groupCreatorId === state.me.id;
+}
+
+function canEndTrip(trip) {
+  return Boolean(trip && trip.status === "started" && (isDriver(trip) || trip.can_admin_end_trip));
+}
+
+function tripStatusLabel(trip) {
+  if (trip && trip.end_reason === "admin_ended") return "Ended by Admin";
+  return trip ? trip.status : "";
 }
 
 function mapLocation(trip) {
@@ -323,8 +356,7 @@ function hydrateUrlActions() {
   }
   state.pendingTab = params.get("tab") || (token ? "group" : null);
   if (params.get("trip")) {
-    state.selectedTripId = params.get("trip");
-    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+    rememberSelectedTrip(params.get("trip"));
   }
   state.pendingSwapRequestId = params.get("swap_request");
 }
@@ -450,22 +482,33 @@ function wireEvents() {
   submit("childForm", saveChild);
   submit("tripForm", async (form) => {
     const data = formJSON(form);
+    if (!data.driver_user_id) throw new Error("Choose a driver for this roster.");
     data.child_ids = [...$("tripChildren").querySelectorAll("input:checked")].map((input) => input.value);
     if (!data.child_ids.length) throw new Error("Choose at least one child");
     const submitter = form.querySelector("button[type='submit']");
-    return withButtonLock(submitter, () => api(`/api/groups/${selectedGroupId()}/trips`, { method: "POST", body: JSON.stringify(data) }));
+    const trip = await withButtonLock(submitter, () => api(`/api/groups/${selectedGroupId()}/trips`, { method: "POST", body: JSON.stringify(data) }));
+    if (trip && trip.driver_user_id && trip.driver_user_id !== data.driver_user_id) {
+      throw new Error("Roster saved with a different driver than selected. Reload and verify before using this roster.");
+    }
+    if (trip && trip.id) rememberSelectedTrip(trip.id);
+    rememberRosterDriver(data.driver_user_id);
+    return trip;
   });
 
   $("groupSelect").addEventListener("change", () => refreshGroupContext().catch((error) => toast(error.message)));
   $("activeTrip").addEventListener("change", async () => {
-    state.selectedTripId = $("activeTrip").value;
-    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+    rememberSelectedTrip($("activeTrip").value);
     await refreshSelectedTripActions();
     renderAll();
+  });
+  $("tripDriver").addEventListener("change", () => {
+    rememberRosterDriver($("tripDriver").value);
   });
   $("logout").addEventListener("click", () => {
     stopTracking();
     localStorage.removeItem("schoolhop_token");
+    sessionStorage.removeItem("schoolhop_selected_trip");
+    sessionStorage.removeItem("schoolhop_selected_roster_driver");
     state.token = null;
     state.knownNotificationIds = new Set();
     state.notificationIdsSeeded = false;
@@ -589,6 +632,7 @@ async function refresh() {
 }
 
 async function refreshGroupContext() {
+  const requestId = ++state.refreshGroupRequestId;
   const groupId = selectedGroupId();
   if (!groupId) {
     state.group = null;
@@ -603,6 +647,7 @@ async function refreshGroupContext() {
       : [[], []];
     const notifications = state.token ? settledValue(notificationsResult, state.notifications, "notifications-refresh") : [];
     const pendingActions = state.token ? settledValue(pendingActionsResult, state.pendingActions, "pending-actions-refresh") : [];
+    if (requestId !== state.refreshGroupRequestId) return;
     setNotifications(notifications);
     state.pendingActions = pendingActions;
     renderAll();
@@ -628,6 +673,7 @@ async function refreshGroupContext() {
       (error) => ({ status: "rejected", reason: error }),
     ),
   ]);
+  if (requestId !== state.refreshGroupRequestId) return;
   state.group = group;
   state.groupChildren = groupChildrenResult;
   state.trips = trips;
@@ -644,19 +690,16 @@ async function refreshGroupContext() {
 
 function chooseSelectedTrip() {
   const trips = activeTrips();
-  const startedTrip = trips.find((trip) => trip.status === "started");
-  if (startedTrip && state.selectedTripId !== startedTrip.id) {
-    state.selectedTripId = startedTrip.id;
-    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
-    return;
-  }
   if (state.selectedTripId && trips.some((trip) => trip.id === state.selectedTripId)) return;
+  const unavailableTripId = state.selectedTripId;
   if (trips[0]) {
-    state.selectedTripId = trips[0].id;
-    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+    rememberSelectedTrip(trips[0].id);
+    if (unavailableTripId && state.selectedTripFallbackNotified !== unavailableTripId) {
+      state.selectedTripFallbackNotified = unavailableTripId;
+      toast("The selected trip is no longer available. Showing the next available trip.");
+    }
   } else {
-    state.selectedTripId = null;
-    localStorage.removeItem("schoolhop_selected_trip");
+    rememberSelectedTrip(null);
   }
 }
 
@@ -682,12 +725,15 @@ async function loadTripHistory() {
 }
 
 async function refreshSelectedTripActions() {
+  const requestId = ++state.selectedTripActionsRequestId;
+  const tripId = state.selectedTripId;
   state.changeRequests = [];
-  if (!state.selectedTripId) return;
+  if (!tripId) return;
   try {
-    state.changeRequests = await api(`/api/trips/${state.selectedTripId}/change-requests`);
+    const requests = await api(`/api/trips/${tripId}/change-requests`);
+    if (requestId === state.selectedTripActionsRequestId && state.selectedTripId === tripId) state.changeRequests = requests;
   } catch {
-    state.changeRequests = [];
+    if (requestId === state.selectedTripActionsRequestId && state.selectedTripId === tripId) state.changeRequests = [];
   }
 }
 
@@ -763,7 +809,19 @@ function renderAccessGroupOptions() {
 
 function renderTrips() {
   const trips = activeTrips();
-  fillSelect($("tripDriver"), (state.group && state.group.members) || [], (m) => `${m.name} (${m.email})`);
+  const rosterDrivers = (state.group && state.group.members) || [];
+  const selectedRosterDriverId = state.selectedRosterDriverId || $("tripDriver").value || "";
+  fillSelectWithPlaceholder($("tripDriver"), rosterDrivers, (m) => `${m.name} (${m.email})`, "Choose driver");
+  if (selectedRosterDriverId && rosterDrivers.some((driver) => driver.id === selectedRosterDriverId)) {
+    $("tripDriver").value = selectedRosterDriverId;
+    rememberRosterDriver(selectedRosterDriverId);
+  } else {
+    $("tripDriver").value = "";
+    if (selectedRosterDriverId && state.rosterDriverWarningId !== selectedRosterDriverId) {
+      state.rosterDriverWarningId = selectedRosterDriverId;
+      toast("The selected driver is no longer available. Choose a replacement before saving.");
+    }
+  }
   $("tripChildren").innerHTML = state.groupChildren.length ? state.groupChildren.map((child) => `
     <label><input type="checkbox" value="${escapeHTML(child.id)}" /> ${escapeHTML(child.name)} <span>${escapeHTML(child.parent_name)}</span></label>
   `).join("") : `<p>No group children available.</p>`;
@@ -775,12 +833,8 @@ function renderTrips() {
   fillSelect($("activeTrip"), trips, (t) => `${t.service_date} ${t.expected_time} ${t.trip_type} - ${(t.driver && t.driver.name) || "driver"}`);
   if (state.selectedTripId && trips.some((trip) => trip.id === state.selectedTripId)) {
     $("activeTrip").value = state.selectedTripId;
-  } else if (trips[0]) {
-    state.selectedTripId = trips[0].id;
-    $("activeTrip").value = state.selectedTripId;
   } else {
-    state.selectedTripId = null;
-    localStorage.removeItem("schoolhop_selected_trip");
+    $("activeTrip").value = "";
   }
   renderTripConsole();
 }
@@ -799,7 +853,7 @@ function tripCard(trip, selectable = true) {
           <strong>${escapeHTML(trip.service_date)} · ${escapeHTML(trip.expected_time)}</strong>
           <span>${escapeHTML(trip.trip_type)} by ${escapeHTML(driverLabel)}</span>
         </div>
-        <div>${pill(trip.status, statusTone(trip.status))}${tracking ? pill("tracking on", "good") : ""}${response}</div>
+        <div>${pill(tripStatusLabel(trip), statusTone(trip.status))}${tracking ? pill("tracking on", "good") : ""}${response}</div>
       </div>
       <p>${escapeHTML(children || "No children visible.")}</p>
       ${etaSummaryHTML(trip)}
@@ -827,6 +881,7 @@ function renderTripConsole() {
     $("swapTrip").classList.add("hidden");
     $("startTrip").disabled = true;
     $("endTrip").disabled = true;
+    $("endTrip").classList.add("hidden");
     $("sendLocation").disabled = true;
     $("swapPanel").classList.add("hidden");
     $("swapRequestPanel").classList.add("hidden");
@@ -857,7 +912,8 @@ function renderTripConsole() {
   $("startTrip").title = !accepted
     ? "Accept this trip before starting it"
     : (!canStartToday ? "Trips can only be started on their service date" : "");
-  $("endTrip").disabled = !driver || trip.status !== "started";
+  $("endTrip").disabled = !canEndTrip(trip);
+  $("endTrip").classList.toggle("hidden", !canEndTrip(trip));
   $("sendLocation").disabled = !driver || trip.status !== "started";
   reconcileLocationPolling(trip);
   renderTripMap(trip);
@@ -1189,8 +1245,7 @@ function updateTripInState(updatedTrip) {
     if (state.trackingTripId === updatedTrip.id) stopTracking();
     state.trips = state.trips.filter((trip) => trip.id !== updatedTrip.id);
     if (state.selectedTripId === updatedTrip.id) {
-      state.selectedTripId = null;
-      localStorage.removeItem("schoolhop_selected_trip");
+      rememberSelectedTrip(null);
       chooseSelectedTrip();
     }
   }
@@ -1264,6 +1319,8 @@ async function deleteAccount() {
     stopTracking();
     localStorage.removeItem("schoolhop_token");
     localStorage.removeItem("schoolhop_pending_invite");
+    sessionStorage.removeItem("schoolhop_selected_trip");
+    sessionStorage.removeItem("schoolhop_selected_roster_driver");
     state.token = null;
     state.me = null;
     state.pendingInviteToken = null;
@@ -1398,8 +1455,7 @@ async function deleteRoster(tripId) {
   if (!window.confirm(`Delete ${label}? This is only allowed before any driver accepts.`)) return;
   await api(`/api/trips/${tripId}`, { method: "DELETE" });
   if (state.selectedTripId === tripId) {
-    state.selectedTripId = null;
-    localStorage.removeItem("schoolhop_selected_trip");
+    rememberSelectedTrip(null);
   }
   await refreshGroupContext();
   toast("Roster deleted");
@@ -1415,7 +1471,7 @@ async function startTrip() {
     if (trip.status !== "started") {
       const started = await api(`/api/trips/${trip.id}/start`, { method: "POST", body: "{}" });
       updateTripInState(started);
-      state.selectedTripId = started.id;
+      rememberSelectedTrip(started.id);
     }
     await startTracking(state.selectedTripId || trip.id);
     renderAll();
@@ -1429,6 +1485,7 @@ async function startTrip() {
 async function endTrip() {
   const trip = selectedTrip();
   if (!trip) return toast("Select a trip first");
+  if (!isDriver(trip) && !window.confirm("End this driver's active trip as group admin? This stops GPS sharing but does not complete outstanding child handovers.")) return;
   try {
     await withButtonLock($("endTrip"), async () => {
     const ended = await api(`/api/trips/${trip.id}/end`, { method: "POST", body: "{}" });
@@ -1673,8 +1730,7 @@ async function onDocumentClick(event) {
   }
   const chooseTrip = target.closest(".choose-trip");
   if (chooseTrip) {
-    state.selectedTripId = chooseTrip.dataset.trip;
-    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+    rememberSelectedTrip(chooseTrip.dataset.trip);
     if ($("activeTrip")) $("activeTrip").value = state.selectedTripId;
     setTab("trip");
     renderAll();
@@ -1682,8 +1738,7 @@ async function onDocumentClick(event) {
   }
   const trackingTrip = target.closest(".trip-card[data-tracking='on']");
   if (trackingTrip && !target.closest("button, a, input, select, textarea")) {
-    state.selectedTripId = trackingTrip.dataset.trip;
-    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+    rememberSelectedTrip(trackingTrip.dataset.trip);
     if ($("activeTrip")) $("activeTrip").value = state.selectedTripId;
     setTab("trip");
     renderAll();
@@ -1773,8 +1828,7 @@ async function openActionUrl(actionUrl) {
   const tripId = url.searchParams.get("trip");
   const swapRequestId = url.searchParams.get("swap_request");
   if (tripId) {
-    state.selectedTripId = tripId;
-    localStorage.setItem("schoolhop_selected_trip", state.selectedTripId);
+    rememberSelectedTrip(tripId);
     if ($("activeTrip")) $("activeTrip").value = state.selectedTripId;
     state.pendingSwapRequestId = swapRequestId;
     await refreshSelectedTripActions();
