@@ -180,7 +180,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         user_id = uuid4()
         group_id = uuid4()
         driver = Record({"id": user_id, "name": "Driver", "email": "driver@example.com", "phone": None})
-        today = date.today()
+        today = main.local_date_for_timezone("Australia/Melbourne")
         planned_today = self.trip(group_id, user_id, today, "planned")
         delayed_future = self.trip(group_id, user_id, date(today.year + 1, 1, 1), "delayed")
         completed_today = self.trip(group_id, user_id, today, "completed")
@@ -208,7 +208,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         user_id = uuid4()
         group_id = uuid4()
         driver = Record({"id": user_id, "name": "Driver", "email": "driver@example.com", "phone": None})
-        trips = [self.trip(group_id, user_id, date.today() + timedelta(days=index), "planned") for index in range(4)]
+        today = main.local_date_for_timezone("Australia/Melbourne")
+        trips = [self.trip(group_id, user_id, today + timedelta(days=index), "planned") for index in range(4)]
         database = TripListDatabase(user_id=user_id, group_id=group_id, trips=trips, driver=driver)
 
         await main.list_trips(group_id, {"id": str(user_id)}, database)
@@ -698,7 +699,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_trip_cannot_start_before_service_date(self):
         user_id = uuid4()
         group_id = uuid4()
-        future_trip = self.trip(group_id, user_id, date.today() + timedelta(days=1), "planned")
+        local_today = main.local_date_for_timezone("Australia/Melbourne")
+        future_trip = self.trip(group_id, user_id, local_today + timedelta(days=1), "planned")
         database = AsyncMock()
 
         def fetchrow(query, *args):
@@ -708,7 +710,13 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 return Record({"group_id": group_id, "user_id": user_id, "role": "member", "status": "active"})
             raise AssertionError(query)
 
+        def fetchval(query, *args):
+            if "SELECT s.timezone" in query:
+                return "Australia/Melbourne"
+            raise AssertionError(query)
+
         database.fetchrow.side_effect = fetchrow
+        database.fetchval.side_effect = fetchval
         user = {"id": str(user_id)}
 
         with self.assertRaises(HTTPException) as raised:
@@ -717,10 +725,39 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail, "Trip can only be started on its service date")
 
+    async def test_trip_cannot_start_after_service_date(self):
+        user_id = uuid4()
+        group_id = uuid4()
+        local_today = main.local_date_for_timezone("Australia/Melbourne")
+        past_trip = self.trip(group_id, user_id, local_today - timedelta(days=1), "planned")
+        database = AsyncMock()
+
+        def fetchrow(query, *args):
+            if "SELECT * FROM trips WHERE id" in query:
+                return past_trip
+            if "FROM group_members" in query:
+                return Record({"group_id": group_id, "user_id": user_id, "role": "member", "status": "active"})
+            raise AssertionError(query)
+
+        def fetchval(query, *args):
+            if "SELECT s.timezone" in query:
+                return "Australia/Melbourne"
+            raise AssertionError(query)
+
+        database.fetchrow.side_effect = fetchrow
+        database.fetchval.side_effect = fetchval
+        user = {"id": str(user_id)}
+
+        with self.assertRaises(HTTPException) as raised:
+            await main.start_trip(past_trip["id"], user, database)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, "Trip can only be started on its service date")
+
     async def test_trip_cannot_start_until_driver_accepts(self):
         user_id = uuid4()
         group_id = uuid4()
-        today_trip = self.trip(group_id, user_id, date.today(), "planned")
+        today_trip = self.trip(group_id, user_id, main.local_date_for_timezone("Australia/Melbourne"), "planned")
         database = AsyncMock()
 
         def fetchrow(query, *args):
@@ -731,6 +768,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(query)
 
         def fetchval(query, *args):
+            if "SELECT s.timezone" in query:
+                return "Australia/Melbourne"
             if "FROM trip_responses" in query:
                 return None
             raise AssertionError(query)
@@ -744,6 +783,63 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail, "Accept this trip before starting it")
+
+    async def test_today_trip_can_start_before_expected_time(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.response_status = "accepted"
+        database.trip = Record({**database.trip, "expected_time": time(23, 59)})
+
+        row = await main.start_trip(ids.trip_id, {"id": str(ids.driver_id), "name": "Driver"}, database)
+
+        self.assertEqual(row["status"], "started")
+
+    async def test_today_trip_can_start_after_expected_time(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.response_status = "accepted"
+        database.trip = Record({**database.trip, "expected_time": time(0, 1)})
+
+        row = await main.start_trip(ids.trip_id, {"id": str(ids.driver_id), "name": "Driver"}, database)
+
+        self.assertEqual(row["status"], "started")
+
+    def test_melbourne_local_date_can_differ_from_utc_date(self):
+        now = datetime(2026, 10, 8, 23, 30, tzinfo=UTC)
+
+        self.assertEqual(main.local_date_for_timezone("UTC", now), date(2026, 10, 8))
+        self.assertEqual(main.local_date_for_timezone("Australia/Melbourne", now), date(2026, 10, 9))
+
+    def test_school_timezone_differs_from_server_timezone(self):
+        now = datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
+
+        self.assertEqual(main.local_date_for_timezone("America/Los_Angeles", now), date(2025, 12, 31))
+        self.assertEqual(main.local_date_for_timezone("Australia/Melbourne", now), date(2026, 1, 1))
+
+    def test_melbourne_daylight_saving_transitions_use_zoneinfo(self):
+        before_dst_starts = datetime(2026, 10, 3, 15, 30, tzinfo=UTC)
+        after_dst_starts = datetime(2026, 10, 3, 16, 30, tzinfo=UTC)
+        before_dst_ends = datetime(2026, 4, 4, 13, 30, tzinfo=UTC)
+        after_dst_ends = datetime(2026, 4, 4, 14, 30, tzinfo=UTC)
+
+        self.assertEqual(main.local_date_for_timezone("Australia/Melbourne", before_dst_starts), date(2026, 10, 4))
+        self.assertEqual(main.local_date_for_timezone("Australia/Melbourne", after_dst_starts), date(2026, 10, 4))
+        self.assertEqual(main.local_date_for_timezone("Australia/Melbourne", before_dst_ends), date(2026, 4, 5))
+        self.assertEqual(main.local_date_for_timezone("Australia/Melbourne", after_dst_ends), date(2026, 4, 5))
+
+    async def test_incorrect_stored_service_date_is_rejected_without_correction(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.response_status = "accepted"
+        wrong_service_date = main.local_date_for_timezone("Australia/Melbourne") - timedelta(days=1)
+        database.trip = Record({**database.trip, "service_date": wrong_service_date})
+
+        with self.assertRaises(HTTPException) as raised:
+            await main.start_trip(ids.trip_id, {"id": str(ids.driver_id), "name": "Driver"}, database)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(database.trip["service_date"], wrong_service_date)
+        self.assertEqual(database.trip["status"], "planned")
 
     async def test_pending_assignment_acceptance_is_recorded_once(self):
         ids = ActionIds()
@@ -1166,7 +1262,7 @@ class RouteDatabase:
                 "id": ids.trip_id,
                 "group_id": ids.group_id,
                 "driver_user_id": ids.driver_id,
-                "service_date": date.today(),
+                "service_date": main.local_date_for_timezone("Australia/Melbourne"),
                 "trip_type": trip_type,
                 "expected_time": time(8, 0),
                 "status": status,
@@ -1228,6 +1324,8 @@ class RouteDatabase:
         raise AssertionError(query)
 
     async def fetchval(self, query, *args):
+        if "SELECT s.timezone" in query:
+            return "Australia/Melbourne"
         if "SELECT created_by FROM carpool_groups" in query:
             return self.ids.organiser_id
         if "FROM trip_children tc" in query and "c.parent_id" in query:
@@ -1538,6 +1636,8 @@ class TripActionDatabase:
         raise AssertionError(query)
 
     async def fetchval(self, query, *args):
+        if "SELECT s.timezone" in query:
+            return "Australia/Melbourne"
         if "SELECT created_by FROM carpool_groups" in query:
             return self.ids.organiser_id
         if "FROM trip_responses" in query:
@@ -1896,6 +1996,8 @@ class TripListDatabase:
         raise AssertionError(query)
 
     async def fetchval(self, query, *args):
+        if "SELECT s.timezone" in query:
+            return "Australia/Melbourne"
         if "SELECT created_by FROM carpool_groups" in query:
             return self.user_id
         if "FROM roster_change_requests" in query:
@@ -1916,11 +2018,12 @@ class TripListDatabase:
             return []
         if "FROM trip_locations" in query:
             return []
-        if "FROM trips" in query and "CURRENT_DATE" in query:
+        if "FROM trips" in query and "t.service_date < $3" in query:
+            today = args[2]
             rows = [
                 trip for trip in self.trips
                 if trip["status"] != "ignored"
-                and (trip["service_date"] < date.today() or trip["status"] in {"completed", "cancelled", "driver_unavailable"})
+                and (trip["service_date"] < today or trip["status"] in {"completed", "cancelled", "driver_unavailable"})
             ]
             return sorted(rows, key=lambda trip: (trip["service_date"], trip["expected_time"]), reverse=True)
         if "FROM trips" in query:

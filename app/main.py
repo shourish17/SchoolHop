@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncpg
 import httpx
@@ -68,6 +69,7 @@ settings = Settings()
 passwords = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 pool: asyncpg.Pool | None = None
 logger = logging.getLogger("schoolhop")
+DEFAULT_SCHOOL_TIMEZONE = "Australia/Melbourne"
 
 
 def row_to_dict(row: asyncpg.Record | None) -> dict[str, Any] | None:
@@ -181,6 +183,17 @@ class SchoolIn(BaseModel):
     address: str | None = Field(default=None, max_length=240)
     city: str | None = Field(default=None, max_length=120)
     country: str = Field(default="DE", min_length=2, max_length=2)
+    timezone: str = Field(default=DEFAULT_SCHOOL_TIMEZONE, min_length=1, max_length=80)
+
+    @field_validator("timezone")
+    @classmethod
+    def timezone_is_valid(cls, value: str) -> str:
+        timezone = value.strip()
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("School timezone must be a valid IANA timezone") from exc
+        return timezone
 
 
 class GroupIn(BaseModel):
@@ -321,6 +334,41 @@ def normalize_email(email: str) -> str:
 
 def normalize_group_name(name: str) -> str:
     return " ".join(name.strip().lower().split())
+
+
+def validated_timezone(timezone: str | None) -> str:
+    candidate = (timezone or DEFAULT_SCHOOL_TIMEZONE).strip() or DEFAULT_SCHOOL_TIMEZONE
+    try:
+        ZoneInfo(candidate)
+    except ZoneInfoNotFoundError:
+        logger.warning("invalid_school_timezone timezone=%s fallback=%s", candidate, DEFAULT_SCHOOL_TIMEZONE)
+        return DEFAULT_SCHOOL_TIMEZONE
+    return candidate
+
+
+def local_date_for_timezone(timezone: str | None, now: datetime | None = None) -> date:
+    zone = ZoneInfo(validated_timezone(timezone))
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return current.astimezone(zone).date()
+
+
+async def group_school_timezone(database: asyncpg.Pool, group_id: UUID | str) -> str:
+    timezone = await database.fetchval(
+        """
+        SELECT s.timezone
+        FROM carpool_groups cg
+        JOIN schools s ON s.id = cg.school_id
+        WHERE cg.id = $1
+        """,
+        UUID(str(group_id)),
+    )
+    return validated_timezone(timezone)
+
+
+async def group_local_date(database: asyncpg.Pool, group_id: UUID | str) -> date:
+    return local_date_for_timezone(await group_school_timezone(database, group_id))
 
 
 def verification_code() -> str:
@@ -638,9 +686,11 @@ async def active_future_driver_assignment_count(database: asyncpg.Pool, user_id:
             """
             SELECT count(*)
             FROM trips t
+            JOIN carpool_groups cg ON cg.id = t.group_id
+            JOIN schools s ON s.id = cg.school_id
             WHERE t.driver_user_id = $1
               AND t.status IN ('planned', 'started', 'delayed', 'driver_unavailable')
-              AND (t.service_date >= CURRENT_DATE OR t.status = 'started')
+              AND (t.service_date >= (now() AT TIME ZONE s.timezone)::date OR t.status = 'started')
               AND ($2::uuid IS NULL OR t.group_id = $2)
             """,
             UUID(str(user_id)),
@@ -682,10 +732,12 @@ async def block_account_deletion_reasons(database: asyncpg.Pool, user_id: UUID |
         """
         SELECT count(*)
         FROM trips t
+        JOIN carpool_groups cg ON cg.id = t.group_id
+        JOIN schools s ON s.id = cg.school_id
         LEFT JOIN trip_responses tr ON tr.trip_id = t.id AND tr.user_id = $1
         WHERE t.driver_user_id = $1
           AND t.status IN ('planned', 'delayed')
-          AND t.service_date >= CURRENT_DATE
+          AND t.service_date >= (now() AT TIME ZONE s.timezone)::date
           AND tr.id IS NULL
         """,
         user_uuid,
@@ -722,11 +774,13 @@ async def active_trip_conflicts_for_member(database: asyncpg.Pool, group_id: UUI
         await database.fetchval(
             """
             SELECT count(*)
-            FROM trips
-            WHERE group_id = $1
-              AND driver_user_id = $2
+            FROM trips t
+            JOIN carpool_groups cg ON cg.id = t.group_id
+            JOIN schools s ON s.id = cg.school_id
+            WHERE t.group_id = $1
+              AND t.driver_user_id = $2
               AND status IN ('planned', 'started', 'delayed', 'driver_unavailable')
-              AND (service_date >= CURRENT_DATE OR status = 'started')
+              AND (t.service_date >= (now() AT TIME ZONE s.timezone)::date OR t.status = 'started')
             """,
             UUID(str(group_id)),
             UUID(str(member_user_id)),
@@ -1391,6 +1445,8 @@ async def list_pending_actions(user: UserDep, database: DbDep) -> list[dict[str,
         SELECT t.*, driver.name AS driver_name
         FROM trips t
         JOIN users driver ON driver.id = t.driver_user_id
+        JOIN carpool_groups cg ON cg.id = t.group_id
+        JOIN schools s ON s.id = cg.school_id
         JOIN group_members gm
           ON gm.group_id = t.group_id
          AND gm.user_id = $1
@@ -1400,7 +1456,7 @@ async def list_pending_actions(user: UserDep, database: DbDep) -> list[dict[str,
          AND tr.user_id = $1
         WHERE t.driver_user_id = $1
           AND t.status IN ('planned', 'delayed')
-          AND t.service_date >= CURRENT_DATE
+          AND t.service_date >= (now() AT TIME ZONE s.timezone)::date
           AND tr.id IS NULL
         ORDER BY t.service_date, t.expected_time
         """,
@@ -1411,6 +1467,8 @@ async def list_pending_actions(user: UserDep, database: DbDep) -> list[dict[str,
         SELECT rcr.*, t.service_date, t.trip_type, t.expected_time, requester.name AS requester_name
         FROM roster_change_requests rcr
         JOIN trips t ON t.id = rcr.trip_id
+        JOIN carpool_groups cg ON cg.id = t.group_id
+        JOIN schools s ON s.id = cg.school_id
         JOIN users requester ON requester.id = rcr.requested_by
         JOIN group_members gm
           ON gm.group_id = t.group_id
@@ -1420,7 +1478,7 @@ async def list_pending_actions(user: UserDep, database: DbDep) -> list[dict[str,
           AND rcr.status = 'open'
           AND rcr.proposed_driver_user_id = $1
           AND t.status IN ('planned', 'delayed')
-          AND t.service_date >= CURRENT_DATE
+          AND t.service_date >= (now() AT TIME ZONE s.timezone)::date
         ORDER BY t.service_date, t.expected_time
         """,
         user_id,
@@ -1837,15 +1895,18 @@ async def list_schools(database: DbDep, q: str | None = None) -> list[dict[str, 
 async def create_school(payload: SchoolIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     row = await database.fetchrow(
         """
-        INSERT INTO schools (name, address, city, country, created_by)
-        VALUES ($1, $2, $3, upper($4), $5)
-        ON CONFLICT (name, city) DO UPDATE SET address = COALESCE(EXCLUDED.address, schools.address)
+        INSERT INTO schools (name, address, city, country, timezone, created_by)
+        VALUES ($1, $2, $3, upper($4), $5, $6)
+        ON CONFLICT (name, city) DO UPDATE SET
+            address = COALESCE(EXCLUDED.address, schools.address),
+            timezone = EXCLUDED.timezone
         RETURNING *
         """,
         payload.name,
         payload.address,
         payload.city,
         payload.country,
+        payload.timezone,
         UUID(user["id"]),
     )
     await audit(database, user["id"], "school.upserted", details={"school_id": str(row["id"])})
@@ -2564,7 +2625,8 @@ async def create_trip(group_id: UUID, payload: TripIn, user: UserDep, database: 
 async def reassign_trip_driver(trip_id: UUID, payload: ReassignTripDriverIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await trip_with_permission(database, user["id"], trip_id)
     await require_group_admin(database, user["id"], trip["group_id"])
-    if trip["status"] not in {"planned", "delayed", "driver_unavailable"} or trip["service_date"] < date.today():
+    today = await group_local_date(database, trip["group_id"])
+    if trip["status"] not in {"planned", "delayed", "driver_unavailable"} or trip["service_date"] < today:
         raise HTTPException(status_code=409, detail="Only active or future unstarted rosters can be reassigned")
     if payload.driver_user_id == trip["driver_user_id"]:
         return await serialize_trip(database, user["id"], trip)
@@ -2620,7 +2682,7 @@ async def reassign_trip_driver(trip_id: UUID, payload: ReassignTripDriverIn, use
 @app.get("/api/groups/{group_id}/trips")
 async def list_trips(group_id: UUID, user: UserDep, database: DbDep, from_date: date | None = None, to_date: date | None = None) -> list[dict[str, Any]]:
     await require_group_member(database, user["id"], group_id)
-    effective_from_date = from_date or date.today()
+    effective_from_date = from_date or await group_local_date(database, group_id)
     rows = await database.fetch(
         """
         SELECT DISTINCT t.*
@@ -2664,6 +2726,7 @@ async def list_trips(group_id: UUID, user: UserDep, database: DbDep, from_date: 
 @app.get("/api/groups/{group_id}/trips/history")
 async def list_trip_history(group_id: UUID, user: UserDep, database: DbDep) -> list[dict[str, Any]]:
     await require_group_member(database, user["id"], group_id)
+    today = await group_local_date(database, group_id)
     rows = await database.fetch(
         """
         SELECT DISTINCT t.*
@@ -2672,7 +2735,7 @@ async def list_trip_history(group_id: UUID, user: UserDep, database: DbDep) -> l
         LEFT JOIN children c ON c.id = tc.child_id
         WHERE t.group_id = $1
           AND t.status <> 'ignored'
-          AND (t.service_date < CURRENT_DATE OR t.status IN ('completed', 'cancelled', 'driver_unavailable'))
+          AND (t.service_date < $3 OR t.status IN ('completed', 'cancelled', 'driver_unavailable'))
           AND (
               t.driver_user_id = $2
               OR c.parent_id = $2
@@ -2691,6 +2754,7 @@ async def list_trip_history(group_id: UUID, user: UserDep, database: DbDep) -> l
         """,
         group_id,
         UUID(user["id"]),
+        today,
     )
     return await serialize_trips(database, user["id"], list(rows))
 
@@ -3013,7 +3077,8 @@ async def start_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
     trip = await require_trip_driver(database, user["id"], trip_id)
     if trip["status"] not in {"planned", "delayed"}:
         raise HTTPException(status_code=409, detail="Trip cannot be started from its current status")
-    if trip["service_date"] != date.today():
+    today = await group_local_date(database, trip["group_id"])
+    if trip["service_date"] != today:
         raise HTTPException(status_code=409, detail="Trip can only be started on its service date")
     accepted = await database.fetchval(
         """
@@ -3035,7 +3100,7 @@ async def start_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
                 raise HTTPException(status_code=403, detail="Assigned driver required")
             if locked_trip["status"] not in {"planned", "delayed"}:
                 raise HTTPException(status_code=409, detail="Trip cannot be started from its current status")
-            if locked_trip["service_date"] != date.today():
+            if locked_trip["service_date"] != today:
                 raise HTTPException(status_code=409, detail="Trip can only be started on its service date")
             child_ids = await trip_child_ids(conn, trip_id)
             await lock_trip_start_scope(conn, locked_trip["driver_user_id"], child_ids)
@@ -3207,7 +3272,8 @@ async def cancel_trip(trip_id: UUID, payload: TripNoteIn, user: UserDep, databas
 @app.post("/api/trips/{trip_id}/delay")
 async def delay_trip(trip_id: UUID, payload: TripNoteIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await require_trip_driver(database, user["id"], trip_id)
-    if trip["status"] not in {"planned", "delayed", "started"} or trip["service_date"] < date.today():
+    today = await group_local_date(database, trip["group_id"])
+    if trip["status"] not in {"planned", "delayed", "started"} or trip["service_date"] < today:
         raise HTTPException(status_code=409, detail="Delay can only be reported for an active or upcoming trip")
     minutes = payload.minutes or 10
     updated = await database.fetchrow(
