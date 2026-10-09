@@ -875,6 +875,21 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("driver already has an active trip", raised.exception.detail)
 
+    async def test_start_trip_completes_safety_timed_out_conflict_before_checking_active_conflicts(self):
+        ids = ActionIds()
+        database = TripActionDatabase(ids)
+        database.response_status = "accepted"
+        expired_trip_id = uuid4()
+        database.active_driver_conflict = expired_trip_id
+        database.safety_timed_out_conflicts = [expired_trip_id]
+
+        row = await main.start_trip(ids.trip_id, {"id": str(ids.driver_id), "name": "Driver"}, database)
+
+        self.assertEqual(row["status"], "started")
+        self.assertIsNone(database.active_driver_conflict)
+        self.assertIn(("trip.safety_timeout_ended", expired_trip_id), database.audit_actions)
+        self.assertIn(("trip.started", ids.trip_id), database.audit_actions)
+
     async def test_start_trip_blocks_active_child_conflict_without_private_details(self):
         ids = ActionIds()
         database = TripActionDatabase(ids)
@@ -1506,13 +1521,14 @@ class TripActionDatabase:
         self.response_status = None
         self.active_driver_conflict = None
         self.active_child_conflict = None
+        self.safety_timed_out_conflicts = []
         self.handover_updates = 0
         self.trip = Record(
             {
                 "id": ids.trip_id,
                 "group_id": ids.group_id,
                 "driver_user_id": ids.driver_id,
-                "service_date": date.today(),
+                "service_date": main.local_date_for_timezone("Australia/Melbourne"),
                 "trip_type": "pickup",
                 "expected_time": time(8, 0),
                 "status": "planned",
@@ -1659,6 +1675,25 @@ class TripActionDatabase:
             return [Record({"child_id": self.ids.child_id})]
         if "FROM children" in query and "FOR UPDATE" in query:
             return [Record({"id": child_id}) for child_id in args[0]]
+        if "UPDATE trips t" in query and "safety_timeout_at < now()" in query:
+            rows = []
+            for trip_id in self.safety_timed_out_conflicts:
+                if trip_id == self.active_driver_conflict:
+                    self.active_driver_conflict = None
+                if trip_id == self.active_child_conflict:
+                    self.active_child_conflict = None
+                rows.append(
+                    Record(
+                        {
+                            "id": trip_id,
+                            "group_id": self.ids.group_id,
+                            "driver_user_id": self.ids.driver_id,
+                            "safety_timeout_at": datetime.now(UTC) - timedelta(minutes=1),
+                        }
+                    )
+                )
+            self.safety_timed_out_conflicts = []
+            return rows
         if "SELECT DISTINCT c.parent_id" in query:
             return [
                 Record({"parent_id": self.ids.parent_id, "child_name": "Child"}),
@@ -1691,6 +1726,9 @@ class TripActionDatabase:
 
     async def execute(self, query, *args):
         if "pg_advisory_xact_lock" in query:
+            return None
+        if "trip.safety_timeout_ended" in query:
+            self.audit_actions.append(("trip.safety_timeout_ended", args[1]))
             return None
         if "INSERT INTO audit_records" in query:
             self.audit_actions.append((args[3], args[2]))

@@ -877,6 +877,60 @@ async def active_driver_trip_conflict(conn: Any, driver_user_id: UUID | str, tri
     )
 
 
+async def complete_safety_timed_out_trip_conflicts(conn: Any, driver_user_id: UUID | str, child_ids: list[UUID]) -> list[asyncpg.Record]:
+    timed_out = await conn.fetch(
+        """
+        WITH candidate AS (
+            SELECT t.id
+            FROM trips t
+            WHERE t.status = 'started'
+              AND t.ended_at IS NULL
+              AND t.safety_timeout_at IS NOT NULL
+              AND t.safety_timeout_at < now()
+              AND (
+                  t.driver_user_id = $1
+                  OR (
+                      $2::uuid[] <> '{}'::uuid[]
+                      AND EXISTS (
+                          SELECT 1
+                          FROM trip_children tc
+                          WHERE tc.trip_id = t.id
+                            AND tc.child_id = ANY($2::uuid[])
+                      )
+                  )
+              )
+            ORDER BY t.id
+        )
+        UPDATE trips t
+        SET status = 'completed',
+            ended_at = now()
+        FROM candidate
+        WHERE t.id = candidate.id
+        RETURNING t.id, t.group_id, t.driver_user_id, t.safety_timeout_at
+        """,
+        UUID(str(driver_user_id)),
+        child_ids,
+    )
+    for trip in timed_out:
+        await conn.execute(
+            """
+            INSERT INTO audit_records (actor_user_id, group_id, trip_id, action, details)
+            VALUES (NULL, $1, $2, 'trip.safety_timeout_ended', $3::jsonb)
+            """,
+            trip["group_id"],
+            trip["id"],
+            json.dumps(
+                {
+                    "trip_id": str(trip["id"]),
+                    "original_driver_id": str(trip["driver_user_id"]),
+                    "reason": "safety_timeout",
+                    "safety_timeout_at": serialize_value(trip["safety_timeout_at"]),
+                }
+            ),
+        )
+    return list(timed_out)
+
+
 async def active_child_trip_conflict(conn: Any, child_ids: list[UUID], trip_id: UUID | str) -> asyncpg.Record | None:
     if not child_ids:
         return None
@@ -3104,6 +3158,7 @@ async def start_trip(trip_id: UUID, user: UserDep, database: DbDep) -> dict[str,
                 raise HTTPException(status_code=409, detail="Trip can only be started on its service date")
             child_ids = await trip_child_ids(conn, trip_id)
             await lock_trip_start_scope(conn, locked_trip["driver_user_id"], child_ids)
+            await complete_safety_timed_out_trip_conflicts(conn, locked_trip["driver_user_id"], child_ids)
             if await active_driver_trip_conflict(conn, locked_trip["driver_user_id"], trip_id):
                 raise HTTPException(status_code=409, detail="This driver already has an active trip. Complete the earlier trip before starting another.")
             if await active_child_trip_conflict(conn, child_ids, trip_id):
