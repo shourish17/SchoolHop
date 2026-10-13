@@ -1,9 +1,9 @@
-const CACHE_NAME = "schoolhop-shell-v27";
+const CACHE_NAME = "schoolhop-shell-v28";
 const APP_SHELL = [
   "/",
   "/static/index.html",
   "/static/styles.css",
-  "/static/app.js?v=27",
+  "/static/app.js?v=28",
   "/static/manifest.webmanifest",
   "/static/icon.svg",
 ];

@@ -32,8 +32,8 @@
       <section id="auth" class="auth-layout">
         <div class="intro">
           <h1>School carpool days, made simple.</h1>
-          <p>One parent account, one active group, clear driver responses, and handover updates for the children in your carpool.</p>
-          <div class="notice">Create an account with email verification before joining or creating a group.</div>
+          <p>One parent account, one active carpool, clear driver responses, and handover updates for the children in your carpool.</p>
+          <div class="notice">Create an account with email verification before joining or starting a carpool.</div>
         </div>
         <div class="auth-card">
           <div class="segmented" role="tablist" aria-label="Authentication mode">
@@ -82,10 +82,9 @@
       <section id="app" class="hidden">
         <nav class="tabs" aria-label="SchoolHop sections">
           <button data-tab="home" class="active" type="button">Home</button>
-          <button data-tab="group" type="button">Group</button>
-          <button data-tab="children" type="button">Children</button>
+          <button data-tab="group" type="button">My Carpool</button>
           <button data-tab="roster" type="button">Roster</button>
-          <button data-tab="trip" type="button">Trip</button>
+          <button data-tab="trip" type="button">Trips</button>
           <button data-tab="alerts" type="button">Alerts</button>
           <button data-tab="account" type="button">Account</button>
         </nav>
@@ -93,7 +92,7 @@
         <section id="home" class="tab active">
           <div class="status-grid">
             <article class="metric">
-              <span>Active group</span>
+              <span>My Carpool</span>
               <strong id="homeGroup">None</strong>
             </article>
             <article class="metric">
@@ -130,62 +129,123 @@
         </section>
 
         <section id="group" class="tab">
-          <div class="grid two">
-            <form id="schoolForm" class="panel">
-              <h2>Add school</h2>
-              <input name="name" placeholder="School name" required />
-              <input name="address" placeholder="Street address for routing" />
-              <input name="city" placeholder="City" />
-              <input name="country" maxlength="2" placeholder="Country code" value="DE" />
-              <button type="submit">Save school</button>
-            </form>
-            <form id="groupForm" class="panel">
-              <h2>Create group</h2>
-              <select name="school_id" id="schoolSelect" required></select>
-              <input name="name" placeholder="Group name" required />
-              <button type="submit">Create group</button>
-            </form>
-          </div>
+          <section id="carpoolActiveView" class="hidden">
+            <section class="panel">
+              <div class="section-head">
+                <div>
+                  <h2>My Carpool</h2>
+                  <p id="carpoolSummaryText"></p>
+                </div>
+                <select id="groupSelect" aria-label="Change Carpool"></select>
+              </div>
+              <div id="carpoolSummary" class="status-grid"></div>
+            </section>
 
-          <section class="panel">
-            <h2>Join group</h2>
-            <form id="acceptInviteForm" class="inline-form">
-              <input name="token" placeholder="Invitation token" required />
-              <button type="submit">Join</button>
-              <button id="declineInvite" class="ghost danger" type="button">Decline</button>
-            </form>
-            <form id="requestAccessForm" class="inline-form">
-              <select id="requestSchool" name="school_id" required></select>
-              <select id="requestGroup" name="group_id" required></select>
-              <button type="submit">Request access</button>
-            </form>
-            <p id="requestAccessHint">Already in a group? Leave your existing group first before requesting access to another.</p>
+            <section class="panel">
+              <h2>Manage Carpool</h2>
+              <div class="manage-menu" role="tablist" aria-label="Manage Carpool">
+                <button class="ghost active" data-manage-section="invite" type="button">Invite a Family</button>
+                <button class="ghost" data-manage-section="families" type="button">Manage Families</button>
+                <button class="ghost" data-manage-section="drivers" type="button">Driver Permissions</button>
+                <button class="ghost" data-manage-section="settings" type="button">Carpool Settings</button>
+              </div>
+
+              <div id="manageInvite" class="manage-panel">
+                <h3>Invite a Family</h3>
+                <form id="inviteForm" class="inline-form">
+                  <input name="email" type="email" placeholder="Parent email" required />
+                  <button type="submit">Invite</button>
+                </form>
+                <div id="invitationHistory" class="stack"></div>
+              </div>
+
+              <div id="manageFamilies" class="manage-panel hidden">
+                <h3>Manage Families</h3>
+                <div id="familiesList" class="stack"></div>
+              </div>
+
+              <div id="manageDrivers" class="manage-panel hidden">
+                <h3>Driver Permissions</h3>
+                <form id="approvalForm">
+                  <select name="child_id" id="approvalChild" required></select>
+                  <select name="driver_user_id" id="approvalDriver" required></select>
+                  <label class="check"><input type="checkbox" name="approved" checked /> Approved to drive this child</label>
+                  <button type="submit">Save Approval</button>
+                </form>
+              </div>
+
+              <div id="manageSettings" class="manage-panel hidden">
+                <h3>Carpool Settings</h3>
+                <div class="stack">
+                  <div>
+                    <label for="settingsGroupSelect">Change Carpool</label>
+                    <select id="settingsGroupSelect"></select>
+                  </div>
+                  <div id="ownerTransferPanel" class="stack hidden">
+                    <label for="transferOwnerSelect">Transfer ownership</label>
+                    <div class="inline-form">
+                      <select id="transferOwnerSelect"></select>
+                      <button id="transferOwnership" class="ghost" type="button">Transfer</button>
+                    </div>
+                  </div>
+                  <button id="leaveGroup" class="ghost danger compact-action" type="button">Leave Carpool</button>
+                </div>
+              </div>
+            </section>
           </section>
 
-          <section class="panel">
-            <div class="section-head">
-              <h2>Active group</h2>
-              <select id="groupSelect"></select>
+          <section id="carpoolEmptyView" class="hidden">
+            <section class="panel">
+              <h2>Welcome to SchoolHop</h2>
+              <p>Connect with other families to organise school pickups and drop-offs.</p>
+              <div class="onboarding-steps" aria-label="Getting started">
+                <span>1. Join or Start a Carpool</span>
+                <span>2. Select School</span>
+                <span>3. Join Request or Carpool Creation</span>
+                <span>4. Add Children</span>
+                <span>5. Ready to Use SchoolHop</span>
+              </div>
+            </section>
+
+            <div class="grid two">
+              <section class="panel">
+                <h2>Join an Existing Carpool</h2>
+                <form id="acceptInviteForm" class="inline-form">
+                  <input name="token" placeholder="Invitation code" required />
+                  <button type="submit">Join a Carpool</button>
+                  <button id="declineInvite" class="ghost danger" type="button">Decline</button>
+                </form>
+                <form id="requestAccessForm" class="stack">
+                  <select id="requestSchool" name="school_id" required></select>
+                  <select id="requestGroup" name="group_id" required></select>
+                  <textarea name="note" placeholder="Optional note to the carpool owner"></textarea>
+                  <button type="submit">Request to Join</button>
+                </form>
+                <p id="requestAccessHint">Already in a carpool? Leave your existing carpool first before requesting access to another.</p>
+                <p id="pendingJoinStatus" class="notice hidden">Your request is pending approval.</p>
+                <button class="ghost text-link add-school-toggle" data-school-target="join" type="button">Can't find your school? Add a School</button>
+              </section>
+
+              <section class="panel">
+                <h2>Start a New Carpool</h2>
+                <form id="groupForm" class="stack">
+                  <select name="school_id" id="schoolSelect" required></select>
+                  <input name="name" placeholder="Carpool name" required />
+                  <button type="submit">Start a Carpool</button>
+                </form>
+                <button class="ghost text-link add-school-toggle" data-school-target="start" type="button">Can't find your school? Add a School</button>
+              </section>
             </div>
-            <form id="inviteForm" class="inline-form">
-              <input name="email" type="email" placeholder="Parent email to invite" required />
-              <button type="submit">Invite</button>
-            </form>
-            <div class="mini-actions">
-              <button id="leaveGroup" class="ghost danger" type="button">Leave group</button>
-            </div>
-            <div id="groupDetail" class="detail-grid"></div>
           </section>
 
-          <section class="panel">
-            <h2>Approve drivers</h2>
-            <form id="approvalForm">
-              <select name="child_id" id="approvalChild" required></select>
-              <select name="driver_user_id" id="approvalDriver" required></select>
-              <label class="check"><input type="checkbox" name="approved" checked /> Approved to drive this child</label>
-              <button type="submit">Save approval</button>
-            </form>
-          </section>
+          <form id="schoolForm" class="panel hidden">
+            <h2>Add a School</h2>
+            <input name="name" placeholder="School name" required />
+            <input name="address" placeholder="Street address for routing" />
+            <input name="city" placeholder="City" />
+            <input name="country" maxlength="2" placeholder="Country code" value="DE" />
+            <button type="submit">Save school</button>
+          </form>
         </section>
 
         <section id="roster" class="tab">
@@ -289,6 +349,7 @@
           <section class="panel">
             <h2>Account Settings</h2>
             <p id="accountEmail"></p>
+            <button id="accountChildrenLink" class="ghost" type="button">My Children</button>
             <button id="deleteAccount" class="danger" type="button">Delete Account</button>
           </section>
         </section>
@@ -296,6 +357,6 @@
     </main>
 
     <div id="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js?v=27"></script>
+    <script src="/static/app.js?v=28"></script>
   </body>
 </html>

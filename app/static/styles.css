@@ -236,6 +236,47 @@ button.text-link {
   background: var(--surface-soft);
 }
 
+.manage-menu {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.manage-menu button {
+  min-height: 40px;
+  padding: 8px 10px;
+}
+.manage-menu button.active {
+  color: #050505;
+  background: var(--primary);
+  border-color: var(--primary);
+}
+.manage-panel {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+.manage-panel label {
+  display: block;
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.onboarding-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.onboarding-steps span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .status-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -455,6 +496,7 @@ fieldset input, .check input { width: auto; min-height: auto; accent-color: var(
   .section-head select { max-width: none; }
   .mini-actions button { flex: 1 1 calc(50% - 8px); }
   .action-panel { grid-template-columns: 1fr; }
+  .manage-menu { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .tabs { top: 61px; }
 }
 
@@ -464,5 +506,6 @@ fieldset input, .check input { width: auto; min-height: auto; accent-color: var(
   .top-actions { flex-direction: column; }
   .top-actions button { min-height: 36px; padding: 7px 10px; }
   .mini-actions button { flex-basis: 100%; }
+  .manage-menu { grid-template-columns: 1fr; }
   .map { min-height: 280px; }
 }

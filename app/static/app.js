@@ -25,6 +25,9 @@ const state = {
   refreshGroupRequestId: 0,
   pendingTab: null,
   pendingSwapRequestId: null,
+  activeManageSection: "invite",
+  addSchoolTarget: "start",
+  pendingJoinGroupId: localStorage.getItem("schoolhop_pending_join_group"),
   showTripHistory: false,
   watchId: null,
   trackingTripId: null,
@@ -367,6 +370,15 @@ function wireEvents() {
   $("showForgotPassword").addEventListener("click", () => toggleAuth("forgotPassword"));
   document.querySelectorAll(".back-login").forEach((button) => button.addEventListener("click", () => toggleAuth("login")));
   document.querySelectorAll(".tabs button").forEach((button) => button.addEventListener("click", () => setTab(button.dataset.tab)));
+  document.querySelectorAll("[data-manage-section]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.activeManageSection = button.dataset.manageSection;
+      renderManagePanels();
+    });
+  });
+  document.querySelectorAll(".add-school-toggle").forEach((button) => {
+    button.addEventListener("click", () => showSchoolForm(button.dataset.schoolTarget || "start"));
+  });
 
   window.addEventListener("beforeinstallprompt", (event) => {
     event.preventDefault();
@@ -437,12 +449,18 @@ function wireEvents() {
   submit("schoolForm", async (form) => {
     const data = formJSON(form);
     if (!data.country) data.country = "DE";
-    return api("/api/schools", { method: "POST", body: JSON.stringify(data) });
+    const school = await api("/api/schools", { method: "POST", body: JSON.stringify(data) });
+    await refreshSchools();
+    selectSchoolForWorkflow(school && school.id);
+    form.reset();
+    form.elements.country.value = "DE";
+    form.classList.add("hidden");
+    return school;
   });
   submit("groupForm", async (form) => {
     const data = formJSON(form);
     const duplicate = state.discoverGroups.find((group) => group.school_id === data.school_id && normalizeGroupName(group.name) === normalizeGroupName(data.name));
-    if (duplicate) throw new Error("A group with this name already exists for this school.");
+    if (duplicate) throw new Error("A carpool with this name already exists for this school.");
     return api("/api/groups", { method: "POST", body: JSON.stringify(data) });
   });
   submit("acceptInviteForm", async (form) => {
@@ -458,19 +476,28 @@ function wireEvents() {
     const data = formJSON(form);
     delete data.school_id;
     try {
-      await api("/api/groups/access-requests", { method: "POST", body: JSON.stringify(data) });
-      toast("Access request sent to the group creator");
+      const request = await api("/api/groups/access-requests", { method: "POST", body: JSON.stringify(data) });
+      state.pendingJoinGroupId = request.group_id || data.group_id;
+      localStorage.setItem("schoolhop_pending_join_group", state.pendingJoinGroupId);
+      renderAccessRequestOptions();
+      toast("Your request is pending approval.");
     } catch (error) {
       if (/Leave your current group/i.test(error.message)) {
-        throw new Error("You have to leave your existing group first.");
+        throw new Error("You have to leave your existing carpool first.");
       }
       throw error;
     }
   });
   $("requestSchool").addEventListener("change", renderAccessGroupOptions);
+  $("settingsGroupSelect").addEventListener("change", () => {
+    $("groupSelect").value = $("settingsGroupSelect").value;
+    refreshGroupContext().catch((error) => toast(error.message));
+  });
   submit("inviteForm", async (form) => {
     const invitation = await api(`/api/groups/${selectedGroupId()}/invitations`, { method: "POST", body: JSON.stringify(formJSON(form)) });
-    toast(`Invite token: ${invitation.token}`);
+    await refreshGroupContext();
+    toast("Invitation created");
+    return invitation;
   }, false);
   submit("approvalForm", async (form) => {
     const data = formJSON(form);
@@ -515,6 +542,8 @@ function wireEvents() {
     refresh();
   });
   $("leaveGroup").addEventListener("click", leaveGroup);
+  $("transferOwnership").addEventListener("click", transferOwnership);
+  $("accountChildrenLink").addEventListener("click", () => setTab("children"));
   $("deleteAccount").addEventListener("click", deleteAccount);
   $("cancelChildEdit").addEventListener("click", resetChildForm);
   $("acceptTrip").addEventListener("click", (event) => tripAction("responses", { status: "accepted" }, event.currentTarget));
@@ -621,14 +650,44 @@ async function refresh() {
   $("sessionSummary").textContent = nativeAppVersion ? `${state.me.email} · v${nativeAppVersion}` : state.me.email;
   state.schools = schoolsResult;
   state.groups = groups;
+  if (state.pendingJoinGroupId && state.groups.some((group) => group.id === state.pendingJoinGroupId)) {
+    state.pendingJoinGroupId = null;
+    localStorage.removeItem("schoolhop_pending_join_group");
+  }
   state.discoverGroups = discoverGroupsResult;
   state.children = childrenResult;
   fillSelect($("schoolSelect"), state.schools, (s) => `${s.name}${s.city ? `, ${s.city}` : ""}`);
   fillSelect($("childSchoolSelect"), state.schools, (s) => `${s.name}${s.city ? `, ${s.city}` : ""}`);
   fillSelect($("groupSelect"), state.groups, (g) => `${g.name} - ${g.school_name}`);
+  fillSelect($("settingsGroupSelect"), state.groups, (g) => `${g.name} - ${g.school_name}`);
   renderAccessRequestOptions();
   if (state.groups[0] && !$("groupSelect").value) $("groupSelect").value = state.groups[0].id;
+  if ($("settingsGroupSelect") && $("groupSelect")) $("settingsGroupSelect").value = $("groupSelect").value;
   await refreshGroupContext();
+}
+
+async function refreshSchools() {
+  state.schools = await api("/api/schools").catch((error) => {
+    reportClientError(error, { source: "schools-refresh" });
+    return state.schools;
+  });
+  fillSelect($("schoolSelect"), state.schools, (s) => `${s.name}${s.city ? `, ${s.city}` : ""}`);
+  fillSelect($("childSchoolSelect"), state.schools, (s) => `${s.name}${s.city ? `, ${s.city}` : ""}`);
+}
+
+function showSchoolForm(target) {
+  state.addSchoolTarget = target || "start";
+  $("schoolForm").classList.remove("hidden");
+  $("schoolForm").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function selectSchoolForWorkflow(schoolId) {
+  if (!schoolId) return;
+  const select = state.addSchoolTarget === "join" ? $("requestSchool") : $("schoolSelect");
+  if (select && [...select.options].some((option) => option.value === schoolId)) {
+    select.value = schoolId;
+    if (select.id === "requestSchool") renderAccessGroupOptions();
+  }
 }
 
 async function refreshGroupContext() {
@@ -768,8 +827,8 @@ function renderHome() {
   $("homeGroup").textContent = (state.group && state.group.group && state.group.group.name) || "None";
   $("homeTrips").textContent = String(trips.length);
   $("homeTracking").textContent = state.watchId !== null || trackedTrips.length ? "Active" : "Off";
-  $("pendingActionPanel").classList.toggle("hidden", !state.pendingActions.length);
-  $("pendingActionList").innerHTML = state.pendingActions.map(actionCard).join("");
+  $("pendingActionPanel").classList.add("hidden");
+  $("pendingActionList").innerHTML = "";
   $("homeCurrentTripPanel").classList.toggle("hidden", !currentTrip);
   $("homeCurrentTripList").innerHTML = currentTrip ? tripCard(currentTrip) : "";
   $("homeNextTripPanel").classList.toggle("hidden", !nextTrip);
@@ -798,6 +857,10 @@ function renderAccessRequestOptions() {
   }
   const schools = [...schoolsById.values()].sort((a, b) => `${a.name} ${a.city || ""}`.localeCompare(`${b.name} ${b.city || ""}`));
   fillSelect($("requestSchool"), schools, (school) => `${school.name}${school.city ? `, ${school.city}` : ""}`);
+  if (state.pendingJoinGroupId) {
+    const pendingGroup = state.discoverGroups.find((group) => group.id === state.pendingJoinGroupId);
+    if (pendingGroup && $("requestSchool")) $("requestSchool").value = pendingGroup.school_id;
+  }
   renderAccessGroupOptions();
 }
 
@@ -805,6 +868,10 @@ function renderAccessGroupOptions() {
   const schoolId = $("requestSchool").value;
   const groups = state.discoverGroups.filter((group) => group.school_id === schoolId);
   fillSelect($("requestGroup"), groups, (group) => group.name);
+  if (state.pendingJoinGroupId && groups.some((group) => group.id === state.pendingJoinGroupId)) $("requestGroup").value = state.pendingJoinGroupId;
+  const pending = Boolean(state.pendingJoinGroupId && $("requestGroup").value === state.pendingJoinGroupId);
+  $("pendingJoinStatus").classList.toggle("hidden", !pending);
+  $("requestAccessForm").classList.toggle("hidden", pending);
 }
 
 function renderTrips() {
@@ -824,7 +891,7 @@ function renderTrips() {
   }
   $("tripChildren").innerHTML = state.groupChildren.length ? state.groupChildren.map((child) => `
     <label><input type="checkbox" value="${escapeHTML(child.id)}" /> ${escapeHTML(child.name)} <span>${escapeHTML(child.parent_name)}</span></label>
-  `).join("") : `<p>No group children available.</p>`;
+  `).join("") : `<p>No carpool children available.</p>`;
   $("tripList").innerHTML = trips.length ? trips.map(tripCard).join("") : empty("No active rosters or trips.");
   $("tripHistoryPanel").classList.toggle("hidden", !state.showTripHistory);
   $("historyTripList").innerHTML = state.historyLoading
@@ -1023,40 +1090,76 @@ function renderChildren() {
 }
 
 function renderMore() {
-  const detail = $("groupDetail");
+  $("carpoolActiveView").classList.toggle("hidden", !state.group);
+  $("carpoolEmptyView").classList.toggle("hidden", Boolean(state.group));
+  $("schoolForm").classList.add("hidden");
   if (!state.group) {
-    detail.innerHTML = empty("Create or join one active group.");
-    $("leaveGroup").disabled = true;
+    renderAccessRequestOptions();
     return;
   }
+  const group = state.group.group;
+  $("carpoolSummaryText").textContent = `${group.school_name}${group.school_city ? `, ${group.school_city}` : ""}`;
+  $("carpoolSummary").innerHTML = `
+    <article class="metric">
+      <span>Carpool name</span>
+      <strong>${escapeHTML(group.name)}</strong>
+    </article>
+    <article class="metric">
+      <span>School</span>
+      <strong>${escapeHTML(group.school_name)}</strong>
+    </article>
+    <article class="metric">
+      <span>Families</span>
+      <strong>${escapeHTML(state.group.members.length)}</strong>
+    </article>`;
   $("leaveGroup").disabled = false;
+  if ($("groupSelect")) $("groupSelect").value = selectedGroupId();
+  if ($("settingsGroupSelect")) $("settingsGroupSelect").value = selectedGroupId();
+  renderManagePanels();
+}
+
+function renderManagePanels() {
+  const sections = ["invite", "families", "drivers", "settings"];
+  sections.forEach((section) => {
+    document.querySelectorAll(`[data-manage-section="${section}"]`).forEach((button) => button.classList.toggle("active", state.activeManageSection === section));
+  });
+  $("manageInvite").classList.toggle("hidden", state.activeManageSection !== "invite");
+  $("manageFamilies").classList.toggle("hidden", state.activeManageSection !== "families");
+  $("manageDrivers").classList.toggle("hidden", state.activeManageSection !== "drivers");
+  $("manageSettings").classList.toggle("hidden", state.activeManageSection !== "settings");
+  if (!state.group) return;
+
+  const owner = isGroupOwner();
   const members = state.group.members.map((m) => `
     <article class="small-card">
-      <strong>${escapeHTML(m.name)}</strong>
-      <span>${escapeHTML(m.email)} · ${escapeHTML(m.role)}</span>
-      ${m.id !== state.me.id && state.group.group.created_by === state.me.id ? `<button class="ghost danger remove-member" data-user="${escapeHTML(m.id)}" type="button">Remove</button>` : ""}
+      <div class="item-head">
+        <div>
+          <strong>${escapeHTML(m.name)}</strong>
+          <span>${escapeHTML(m.email)} · ${escapeHTML(m.role)} · active</span>
+        </div>
+        ${m.id !== state.me.id && owner ? `<button class="ghost danger compact-action remove-member" data-user="${escapeHTML(m.id)}" type="button">Remove</button>` : ""}
+      </div>
     </article>`).join("");
-  const invitations = state.group.invitations.map((inv) => `
+  $("familiesList").innerHTML = members || empty("No families.");
+
+  const invitations = state.group.invitations.map((inv) => {
+    const inviteLink = inv.status === "pending" && inv.token ? `${state.config.public_site_url || window.location.origin}/?invite=${inv.token}` : "";
+    return `
     <article class="small-card">
       <strong>${escapeHTML(inv.email)}</strong>
       <span>${escapeHTML(inv.status)}</span>
-      ${inv.status === "pending" && inv.token ? `<p>Code: <strong>${escapeHTML(inv.token)}</strong></p>` : ""}
-      ${inv.status === "pending" && inv.token ? `<p>Link: ${escapeHTML(`${state.config.public_site_url || window.location.origin}/?invite=${inv.token}`)}</p>` : ""}
-    </article>`).join("");
-  const joinRequests = (state.group.join_requests || []).map((request) => `
-    <article class="small-card">
-      <strong>${escapeHTML(request.requester_name)}</strong>
-      <span>${escapeHTML(request.requester_email)} · ${escapeHTML(request.status)}</span>
-      ${request.requester_note ? `<p>${escapeHTML(request.requester_note)}</p>` : ""}
-      <div class="mini-actions">
-        <button class="approve-access" data-request="${escapeHTML(request.id)}" type="button">Approve</button>
-        <button class="ghost danger decline-access" data-request="${escapeHTML(request.id)}" type="button">Decline</button>
-      </div>
-    </article>`).join("");
-  detail.innerHTML = `
-    <div><h3>Members</h3><div class="stack">${members || empty("No members.")}</div></div>
-    <div><h3>Invitations</h3><div class="stack">${invitations || empty("No invitations.")}</div></div>
-    ${state.group.group.created_by === state.me.id ? `<div><h3>Access requests</h3><div class="stack">${joinRequests || empty("No pending access requests.")}</div></div>` : ""}`;
+      ${inviteLink ? `<button class="ghost compact-action copy-invite" data-link="${escapeHTML(inviteLink)}" type="button">Copy Invite Link</button>` : ""}
+    </article>`;
+  }).join("");
+  $("invitationHistory").innerHTML = invitations || empty("No invitations yet.");
+
+  const transferMembers = state.group.members.filter((member) => member.id !== state.me.id);
+  fillSelect($("transferOwnerSelect"), transferMembers, (member) => `${member.name} (${member.email})`);
+  $("ownerTransferPanel").classList.toggle("hidden", !owner || !transferMembers.length);
+}
+
+function isGroupOwner() {
+  return Boolean(state.group && state.me && state.group.group.created_by === state.me.id);
 }
 
 function renderAccount() {
@@ -1065,7 +1168,8 @@ function renderAccount() {
 }
 
 function renderNotifications() {
-  $("notificationList").innerHTML = state.notifications.length ? state.notifications.slice(0, 8).map((n) => `
+  const pendingCards = pendingAlertCards();
+  const historyCards = state.notifications.length ? state.notifications.slice(0, 30).map((n) => `
     <article class="item-card notification-card" data-notification="${escapeHTML(n.id)}">
       <div class="notification-main${notificationActionUrl(n) ? " notification-action" : ""}" ${notificationActionUrl(n) ? `data-url="${escapeHTML(notificationActionUrl(n))}" tabindex="0" role="button"` : ""}>
         <div class="item-head"><strong>${escapeHTML(n.title)}</strong>${pill(n.kind)}</div>
@@ -1073,8 +1177,60 @@ function renderNotifications() {
         <span>${escapeHTML(new Date(n.created_at).toLocaleString())}</span>
       </div>
       <button class="ghost danger notification-delete" data-notification="${escapeHTML(n.id)}" type="button" aria-label="Delete notification">Delete</button>
-    </article>`).join("") : empty("No notifications yet.");
+    </article>`).join("") : "";
+  $("notificationList").innerHTML = [pendingCards, historyCards].filter(Boolean).join("") || empty("No alerts yet.");
   $("clearReadNotifications").classList.toggle("hidden", !state.notifications.some((notification) => notification.read_at));
+}
+
+function pendingAlertCards() {
+  const actions = state.pendingActions.map((action) => {
+    if (action.type === "invitation") {
+      const token = new URL(action.action_url || "", window.location.origin).searchParams.get("invite") || "";
+      return `
+        <article class="item-card">
+          <div class="item-head"><strong>${escapeHTML(action.title)}</strong>${pill("pending")}</div>
+          <p>${escapeHTML(action.body)}</p>
+          <div class="mini-actions">
+            <button class="accept-pending-invite" data-token="${escapeHTML(token)}" type="button">Accept</button>
+            <button class="ghost danger decline-pending-invite" data-token="${escapeHTML(token)}" type="button">Decline</button>
+          </div>
+        </article>`;
+    }
+    if (action.type === "driver_assignment") {
+      return `
+        <article class="item-card">
+          <div class="item-head"><strong>${escapeHTML(action.title)}</strong>${pill("pending")}</div>
+          <p>${escapeHTML(action.body)}</p>
+          <div class="mini-actions">
+            <button class="accept-driver-assignment" data-trip="${escapeHTML(action.trip_id)}" type="button">Accept</button>
+            <button class="ghost danger decline-driver-assignment" data-trip="${escapeHTML(action.trip_id)}" type="button">Decline</button>
+          </div>
+        </article>`;
+    }
+    if (action.type === "swap_request") {
+      return `
+        <article class="item-card">
+          <div class="item-head"><strong>${escapeHTML(action.title)}</strong>${pill("pending")}</div>
+          <p>${escapeHTML(action.body)}</p>
+          <div class="mini-actions">
+            <button class="decide-swap" data-request="${escapeHTML(action.id)}" data-status="accepted" type="button">Accept</button>
+            <button class="ghost danger decide-swap" data-request="${escapeHTML(action.id)}" data-status="declined" type="button">Decline</button>
+          </div>
+        </article>`;
+    }
+    return actionCard(action);
+  });
+  const joinRequests = state.group && isGroupOwner() ? (state.group.join_requests || []).map((request) => `
+    <article class="item-card">
+      <div class="item-head"><strong>Join Request</strong>${pill("pending")}</div>
+      <p>${escapeHTML(request.requester_name)} (${escapeHTML(request.requester_email)}) requested to join ${escapeHTML(state.group.group.name)}.</p>
+      ${request.requester_note ? `<p>${escapeHTML(request.requester_note)}</p>` : ""}
+      <div class="mini-actions">
+        <button class="approve-access" data-request="${escapeHTML(request.id)}" type="button">Approve</button>
+        <button class="ghost danger decline-access" data-request="${escapeHTML(request.id)}" type="button">Decline</button>
+      </div>
+    </article>`) : [];
+  return [...actions, ...joinRequests].join("");
 }
 
 function notificationActionUrl(notification) {
@@ -1283,8 +1439,12 @@ function clearPendingInvite(token) {
 
 async function declineInvitation() {
   const token = $("acceptInviteForm").elements.token.value.trim();
+  await declineInvitationToken(token);
+}
+
+async function declineInvitationToken(token) {
   if (!token) return toast("Enter an invitation code first");
-  if (!window.confirm("Decline this group invitation?")) return;
+  if (!window.confirm("Decline this carpool invitation?")) return;
   try {
     await api(`/api/invitations/${encodeURIComponent(token)}/decline`, { method: "POST", body: "{}" });
     state.pendingActions = state.pendingActions.filter((action) => action.type !== "invitation" || action.action_url !== `/?invite=${token}`);
@@ -1292,6 +1452,19 @@ async function declineInvitation() {
     $("acceptInviteForm").reset();
     renderAll();
     toast("Invitation declined");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function acceptInvitationToken(token) {
+  if (!token) return toast("Invitation code is missing");
+  try {
+    const result = await api(`/api/invitations/${encodeURIComponent(token)}/accept`, { method: "POST", body: "{}" });
+    state.pendingActions = state.pendingActions.filter((action) => action.type !== "invitation" || action.action_url !== `/?invite=${token}`);
+    clearPendingInvite(token);
+    await refresh();
+    toast(result && result.status ? "Invitation accepted" : "Joined carpool");
   } catch (error) {
     toast(error.message);
   }
@@ -1340,14 +1513,40 @@ function resetChildForm() {
 
 async function leaveGroup() {
   const groupId = selectedGroupId();
-  if (!groupId) return toast("No active group");
+  if (!groupId) return toast("No active carpool");
+  if (!window.confirm("Leave this carpool?")) return;
   try {
     await api(`/api/groups/${groupId}/leave`, { method: "POST", body: "{}" });
     await refresh();
-    toast("Left group");
+    toast("Left carpool");
   } catch (error) {
     toast(error.message);
   }
+}
+
+async function transferOwnership() {
+  const groupId = selectedGroupId();
+  const newCreatorId = $("transferOwnerSelect").value;
+  if (!groupId || !newCreatorId) return toast("Choose a family member first.");
+  const label = $("transferOwnerSelect").selectedOptions[0] ? $("transferOwnerSelect").selectedOptions[0].textContent : "this member";
+  if (!window.confirm(`Transfer carpool ownership to ${label}?`)) return;
+  try {
+    await api(`/api/groups/${groupId}/transfer-ownership`, {
+      method: "POST",
+      body: JSON.stringify({ new_creator_user_id: newCreatorId }),
+    });
+    await refresh();
+    toast("Ownership transferred");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function driverAssignmentDecision(tripId, status, button = null) {
+  if (!tripId) return toast("Trip is missing");
+  rememberSelectedTrip(tripId);
+  if ($("activeTrip")) $("activeTrip").value = tripId;
+  await tripAction("responses", { status }, button);
 }
 
 async function tripAction(path, body = {}, button = null) {
@@ -1485,7 +1684,7 @@ async function startTrip() {
 async function endTrip() {
   const trip = selectedTrip();
   if (!trip) return toast("Select a trip first");
-  if (!isDriver(trip) && !window.confirm("End this driver's active trip as group admin? This stops GPS sharing but does not complete outstanding child handovers.")) return;
+  if (!isDriver(trip) && !window.confirm("End this driver's active trip as carpool admin? This stops GPS sharing but does not complete outstanding child handovers.")) return;
   try {
     await withButtonLock($("endTrip"), async () => {
     const ended = await api(`/api/trips/${trip.id}/end`, { method: "POST", body: "{}" });
@@ -1713,6 +1912,36 @@ async function onDocumentClick(event) {
     await deleteNotification(deleteNotificationButton.dataset.notification);
     return;
   }
+  const copyInvite = target.closest(".copy-invite");
+  if (copyInvite) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(copyInvite.dataset.link);
+    } else {
+      window.prompt("Copy invite link", copyInvite.dataset.link);
+    }
+    toast("Invite link copied");
+    return;
+  }
+  const acceptPendingInvite = target.closest(".accept-pending-invite");
+  if (acceptPendingInvite) {
+    await acceptInvitationToken(acceptPendingInvite.dataset.token);
+    return;
+  }
+  const declinePendingInvite = target.closest(".decline-pending-invite");
+  if (declinePendingInvite) {
+    await declineInvitationToken(declinePendingInvite.dataset.token);
+    return;
+  }
+  const acceptAssignment = target.closest(".accept-driver-assignment");
+  if (acceptAssignment) {
+    await driverAssignmentDecision(acceptAssignment.dataset.trip, "accepted", acceptAssignment);
+    return;
+  }
+  const declineAssignment = target.closest(".decline-driver-assignment");
+  if (declineAssignment) {
+    await driverAssignmentDecision(declineAssignment.dataset.trip, "declined", declineAssignment);
+    return;
+  }
   const notification = target.closest(".notification-action");
   if (notification && !target.closest("button, a, input, select, textarea")) {
     await openActionUrl(notification.dataset.url || "");
@@ -1767,9 +1996,10 @@ async function onDocumentClick(event) {
   }
   const removeMember = target.closest(".remove-member");
   if (removeMember) {
+    if (!window.confirm("Remove this family from the carpool?")) return;
     await api(`/api/groups/${selectedGroupId()}/members/${removeMember.dataset.user}/remove`, { method: "POST", body: "{}" });
     await refresh();
-    toast("Member removed");
+    toast("Family removed");
     return;
   }
   const accessDecision = target.closest(".approve-access, .decline-access");

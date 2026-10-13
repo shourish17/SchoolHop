@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=27/);
-  assert.match(worker, /schoolhop-shell-v27/);
-  assert.match(worker, /\/static\/app\.js\?v=27/);
+  assert.match(html, /\/static\/app\.js\?v=28/);
+  assert.match(worker, /schoolhop-shell-v28/);
+  assert.match(worker, /\/static\/app\.js\?v=28/);
 });
 
 test("registration UI uses verified account creation flow", async () => {
@@ -46,14 +46,16 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   const html = await read("app/static/index.html");
   const app = await read("app/static/app.js");
 
-  for (const tab of ["home", "group", "children", "roster", "trip", "alerts", "account"]) {
+  for (const tab of ["home", "group", "roster", "trip", "alerts", "account"]) {
     assert.match(html, new RegExp(`data-tab="${tab}"`));
   }
+  assert.doesNotMatch(html, /data-tab="children"/);
+  assert.match(html, /id="accountChildrenLink"/);
   assert.match(html, /id="showTripHistory"/);
   assert.match(html, /id="requestAccessForm"/);
   assert.match(html, /id="requestSchool"/);
   assert.match(html, /id="requestGroup"/);
-  assert.match(html, /Request access/);
+  assert.match(html, /Request to Join/);
   assert.match(html, /Trip History/);
   assert.doesNotMatch(html, /id="rosterHistoryTripList"/);
   assert.match(html, /id="historyTripList"/);
@@ -65,13 +67,13 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   assert.match(app, /async function loadTripHistory/);
   assert.match(app, /state\.history = await api\(`\/api\/groups\/\$\{groupId\}\/trips\/history`\)/);
   assert.doesNotMatch(app, /rosterHistoryTripList/);
-  assert.match(app, /Invite token:/);
-  assert.match(app, /Code:/);
+  assert.match(app, /Invitation created/);
+  assert.match(app, /Copy Invite Link/);
   assert.match(html, /id="declineInvite"/);
   assert.match(app, /schoolhop_pending_invite/);
   assert.match(app, /\/api\/invitations\/\$\{encodeURIComponent\(token\)\}\/decline/);
-  assert.match(app, /Access request sent to the group creator/);
-  assert.match(app, /You have to leave your existing group first/);
+  assert.match(app, /Your request is pending approval/);
+  assert.match(app, /You have to leave your existing carpool first/);
   assert.match(app, /\/api\/groups\/discover/);
   assert.match(app, /function renderAccessRequestOptions/);
   assert.match(app, /function isTodayTrip/);
@@ -122,7 +124,7 @@ test("account deletion and Australian postcode controls are present", async () =
   assert.doesNotMatch(html, /name="home_country"/);
   assert.match(app, /valid four-digit Australian postcode/);
   assert.match(app, /normalizeGroupName/);
-  assert.match(app, /A group with this name already exists for this school/);
+  assert.match(app, /A carpool with this name already exists for this school/);
 });
 
 test("home screen orders pending actions, current trip, next trip, and upcoming trips", async () => {
@@ -142,7 +144,7 @@ test("home screen orders pending actions, current trip, next trip, and upcoming 
   assert.doesNotMatch(html, /Next rosters/);
   assert.match(app, /api\("\/api\/pending-actions"\)/);
   assert.match(app, /state\.pendingActions = pendingActions/);
-  assert.match(app, /\$\("pendingActionPanel"\)\.classList\.toggle\("hidden", !state\.pendingActions\.length\)/);
+  assert.match(app, /\$\("pendingActionPanel"\)\.classList\.add\("hidden"\)/);
   assert.match(app, /const currentTrip = startedTrips\[0\] \|\| null/);
   assert.match(app, /const currentTrip = startedTrips\[0\] \|\| null/);
   assert.match(app, /const nextTrip = upcomingTrips\[0\] \|\| null/);
