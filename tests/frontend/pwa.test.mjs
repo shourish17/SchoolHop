@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=28/);
-  assert.match(worker, /schoolhop-shell-v28/);
-  assert.match(worker, /\/static\/app\.js\?v=28/);
+  assert.match(html, /\/static\/app\.js\?v=29/);
+  assert.match(worker, /schoolhop-shell-v29/);
+  assert.match(worker, /\/static\/app\.js\?v=29/);
 });
 
 test("registration UI uses verified account creation flow", async () => {
@@ -74,6 +74,9 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   assert.match(app, /\/api\/invitations\/\$\{encodeURIComponent\(token\)\}\/decline/);
   assert.match(app, /Your request is pending approval/);
   assert.match(app, /You have to leave your existing carpool first/);
+  assert.match(app, /function joinRequestCards/);
+  assert.match(html, /id="carpoolJoinRequests"/);
+  assert.match(app, /function sentInvitationAlertCards/);
   assert.match(app, /\/api\/groups\/discover/);
   assert.match(app, /function renderAccessRequestOptions/);
   assert.match(app, /function isTodayTrip/);

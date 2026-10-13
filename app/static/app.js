@@ -1112,6 +1112,7 @@ function renderMore() {
       <span>Families</span>
       <strong>${escapeHTML(state.group.members.length)}</strong>
     </article>`;
+  renderJoinRequestCards($("carpoolJoinRequests"), { emptyWhenNone: false });
   $("leaveGroup").disabled = false;
   if ($("groupSelect")) $("groupSelect").value = selectedGroupId();
   if ($("settingsGroupSelect")) $("settingsGroupSelect").value = selectedGroupId();
@@ -1142,17 +1143,6 @@ function renderManagePanels() {
     </article>`).join("");
   $("familiesList").innerHTML = members || empty("No families.");
 
-  const invitations = state.group.invitations.map((inv) => {
-    const inviteLink = inv.status === "pending" && inv.token ? `${state.config.public_site_url || window.location.origin}/?invite=${inv.token}` : "";
-    return `
-    <article class="small-card">
-      <strong>${escapeHTML(inv.email)}</strong>
-      <span>${escapeHTML(inv.status)}</span>
-      ${inviteLink ? `<button class="ghost compact-action copy-invite" data-link="${escapeHTML(inviteLink)}" type="button">Copy Invite Link</button>` : ""}
-    </article>`;
-  }).join("");
-  $("invitationHistory").innerHTML = invitations || empty("No invitations yet.");
-
   const transferMembers = state.group.members.filter((member) => member.id !== state.me.id);
   fillSelect($("transferOwnerSelect"), transferMembers, (member) => `${member.name} (${member.email})`);
   $("ownerTransferPanel").classList.toggle("hidden", !owner || !transferMembers.length);
@@ -1169,6 +1159,7 @@ function renderAccount() {
 
 function renderNotifications() {
   const pendingCards = pendingAlertCards();
+  const sentInvitationCards = sentInvitationAlertCards();
   const historyCards = state.notifications.length ? state.notifications.slice(0, 30).map((n) => `
     <article class="item-card notification-card" data-notification="${escapeHTML(n.id)}">
       <div class="notification-main${notificationActionUrl(n) ? " notification-action" : ""}" ${notificationActionUrl(n) ? `data-url="${escapeHTML(notificationActionUrl(n))}" tabindex="0" role="button"` : ""}>
@@ -1178,7 +1169,7 @@ function renderNotifications() {
       </div>
       <button class="ghost danger notification-delete" data-notification="${escapeHTML(n.id)}" type="button" aria-label="Delete notification">Delete</button>
     </article>`).join("") : "";
-  $("notificationList").innerHTML = [pendingCards, historyCards].filter(Boolean).join("") || empty("No alerts yet.");
+  $("notificationList").innerHTML = [pendingCards, sentInvitationCards, historyCards].filter(Boolean).join("") || empty("No alerts yet.");
   $("clearReadNotifications").classList.toggle("hidden", !state.notifications.some((notification) => notification.read_at));
 }
 
@@ -1220,7 +1211,13 @@ function pendingAlertCards() {
     }
     return actionCard(action);
   });
-  const joinRequests = state.group && isGroupOwner() ? (state.group.join_requests || []).map((request) => `
+  const joinRequests = joinRequestCards();
+  return [...actions, ...joinRequests].join("");
+}
+
+function joinRequestCards() {
+  if (!state.group || !isGroupOwner()) return [];
+  return (state.group.join_requests || []).map((request) => `
     <article class="item-card">
       <div class="item-head"><strong>Join Request</strong>${pill("pending")}</div>
       <p>${escapeHTML(request.requester_name)} (${escapeHTML(request.requester_email)}) requested to join ${escapeHTML(state.group.group.name)}.</p>
@@ -1229,8 +1226,28 @@ function pendingAlertCards() {
         <button class="approve-access" data-request="${escapeHTML(request.id)}" type="button">Approve</button>
         <button class="ghost danger decline-access" data-request="${escapeHTML(request.id)}" type="button">Decline</button>
       </div>
-    </article>`) : [];
-  return [...actions, ...joinRequests].join("");
+    </article>`);
+}
+
+function renderJoinRequestCards(container, { emptyWhenNone = true } = {}) {
+  if (!container) return;
+  const cards = joinRequestCards();
+  container.classList.toggle("hidden", !cards.length && !emptyWhenNone);
+  container.innerHTML = cards.length ? cards.join("") : (emptyWhenNone ? empty("No pending join requests.") : "");
+}
+
+function sentInvitationAlertCards() {
+  if (!state.group || !isGroupOwner() || !state.group.invitations.length) return "";
+  const invitations = state.group.invitations.slice(0, 10).map((inv) => {
+    const inviteLink = inv.status === "pending" && inv.token ? `${state.config.public_site_url || window.location.origin}/?invite=${inv.token}` : "";
+    return `
+      <article class="item-card">
+        <div class="item-head"><strong>Sent Invitation</strong>${pill(inv.status || "sent")}</div>
+        <p>${escapeHTML(inv.email)}</p>
+        ${inviteLink ? `<div class="mini-actions"><button class="ghost compact-action copy-invite" data-link="${escapeHTML(inviteLink)}" type="button">Copy Invite Link</button></div>` : ""}
+      </article>`;
+  }).join("");
+  return invitations;
 }
 
 function notificationActionUrl(notification) {

@@ -139,6 +139,7 @@
                 <select id="groupSelect" aria-label="Change Carpool"></select>
               </div>
               <div id="carpoolSummary" class="status-grid"></div>
+              <div id="carpoolJoinRequests" class="stack hidden"></div>
             </section>
 
             <section class="panel">
@@ -156,7 +157,7 @@
                   <input name="email" type="email" placeholder="Parent email" required />
                   <button type="submit">Invite</button>
                 </form>
-                <div id="invitationHistory" class="stack"></div>
+                <p class="hint">Sent invitations and copy links are available in Alerts.</p>
               </div>
 
               <div id="manageFamilies" class="manage-panel hidden">
@@ -357,6 +358,6 @@
     </main>
 
     <div id="toast" role="status" aria-live="polite"></div>
-    <script src="/static/app.js?v=28"></script>
+    <script src="/static/app.js?v=29"></script>
   </body>
 </html>
