@@ -83,6 +83,44 @@ SCHOOLHOP_CAPACITOR_API_BASE_URL=https://your-staging-host.example npm run andro
 
 The Android native tracking plugin rejects non-HTTPS API base URLs. Production traffic must remain HTTPS-only.
 
+## System bars and header
+
+`MainActivity` enables edge-to-edge with AndroidX on supported Android versions,
+including mandatory edge-to-edge on Android 15/API 35 and Android 16/API 36.
+The native content container applies the current `systemBars` and `displayCutout`
+insets to all four sides. This keeps the entire WebView, including scrolling
+content, outside status bars, camera cutouts, gesture navigation and button navigation.
+Insets are reapplied on rotation, window resizing and display scaling.
+
+Capacitor's `android.adjustMarginsForEdgeToEdge` is explicitly `disable` because
+`MainActivity` owns these insets. The activity zeroes only the handled inset types
+before delivering them to the WebView, preventing duplicate CSS safe-area padding
+on newer WebViews while preserving keyboard inset updates. Do not add Android
+status-bar heights or a second CSS top inset. The activity uses `adjustResize`
+for keyboard compatibility with older WebViews. iOS keeps `contentInset: automatic`
+and the frontend's existing CSS safe-area rules.
+
+The header retains the existing Sign Out control and Alerts tab. Header text can
+shrink or wrap without pushing Sign Out offscreen; its tap target is at least 48px
+high. A `ResizeObserver` keeps sticky navigation below the actual header height,
+including when the install button appears or text scaling changes.
+
+Run the isolated browser regressions with:
+
+```bash
+npx playwright install chromium
+npm run test:layout
+```
+
+These tests use the real frontend with API fixtures and no live backend. They
+cover portrait/landscape Pixel 7 viewport sizes, small phones, tablets, desktop,
+larger text/display settings, sticky scrolling, install controls, and touch Sign
+Out online and offline. Sign Out removes the stored bearer token and remembered
+trip/driver selection, stops tracking/polling, and returns to the login form.
+There is no server logout endpoint in this bearer-token flow. Browser hit testing
+verifies the tap target separately from session cleanup; native system-bar behavior
+must also be checked on an emulator/device.
+
 ## GPS Tracking
 
 Android tracking starts only after the existing frontend successfully starts an authorised assigned-driver trip through `POST /api/trips/{trip_id}/start`. The native plugin then starts a location foreground service and posts location updates to `POST /api/trips/{trip_id}/locations`.

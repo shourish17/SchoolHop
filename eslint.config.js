@@ -19,11 +19,11 @@ module.exports = [
     },
   },
   {
-    files: ["tests/frontend/*.mjs"],
+    files: ["tests/frontend/*.mjs", "tests/layout/*.mjs", "playwright.config.mjs"],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "module",
-      globals: globals.node,
+      globals: { ...globals.node, ...globals.browser },
     },
   },
 ];

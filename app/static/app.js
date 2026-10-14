@@ -333,6 +333,7 @@ function etaSummaryHTML(trip) {
 }
 
 async function init() {
+  observeHeaderSize();
   state.config = await api("/api/config").catch(() => ({}));
   if (nativeAppVersion) state.config.app_version = nativeAppVersion;
   hydrateUrlActions();
@@ -341,6 +342,13 @@ async function init() {
   registerServiceWorker();
   await refresh();
   await registerNativePushToken();
+}
+
+function observeHeaderSize() {
+  const header = document.querySelector(".topbar");
+  const update = () => document.documentElement.style.setProperty("--topbar-height", `${header.getBoundingClientRect().height}px`);
+  update();
+  new ResizeObserver(update).observe(header);
 }
 
 function registerServiceWorker() {
@@ -544,8 +552,13 @@ function wireEvents() {
     sessionStorage.removeItem("schoolhop_selected_trip");
     sessionStorage.removeItem("schoolhop_selected_roster_driver");
     state.token = null;
+    state.me = null;
+    state.selectedTripId = null;
+    state.selectedRosterDriverId = null;
+    stopLocationPolling();
     state.knownNotificationIds = new Set();
     state.notificationIdsSeeded = false;
+    toggleAuth("login");
     refresh();
   });
   $("leaveGroup").addEventListener("click", leaveGroup);

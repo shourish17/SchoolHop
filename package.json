@@ -11,12 +11,14 @@
     "android:build": "npm run ios:build",
     "android:sync": "npm run android:build && npx cap sync android && node scripts/patch-capacitor-android-push.js",
     "android:open": "npx cap open android",
-    "lint": "eslint app/static/app.js app/static/service-worker.js tests/frontend/*.mjs",
+    "lint": "eslint app/static/app.js app/static/service-worker.js tests/frontend/*.mjs tests/layout/*.mjs playwright.config.mjs",
     "test": "node --test tests/frontend/*.test.mjs",
+    "test:layout": "playwright test",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",
+    "@playwright/test": "^1.60.0",
     "eslint": "^9.36.0",
     "globals": "^15.15.0",
     "typescript": "^5.6.3"

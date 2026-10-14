@@ -69,6 +69,12 @@ jobs:
       - name: Run frontend lint
         run: npm run lint
 
+      - name: Install browser for layout regression tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Check header layout and Sign Out
+        run: npm run test:layout
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -114,7 +120,7 @@ jobs:
 
       - name: Build debug APK
         working-directory: android
-        run: ./gradlew --no-daemon assembleDebug
+        run: ./gradlew --no-daemon assembleDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
