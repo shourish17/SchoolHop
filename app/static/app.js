@@ -44,6 +44,7 @@ const state = {
   notificationIdsSeeded: false,
   nativePushListenerRegistered: false,
   nativeNotificationChannelsCreated: false,
+  androidFirebaseMessagingConfigured: null,
 };
 
 const ROUTE_REFRESH_MS = 30000;
@@ -2124,6 +2125,7 @@ async function registerNativePushToken() {
   if (!isNativeApp || !state.token) return;
   const { PushNotifications } = nativePlugins();
   if (!PushNotifications) return;
+  if (nativePlatform() === "android" && !(await androidFirebaseMessagingConfigured())) return;
   if (!state.nativeNotificationChannelsCreated && nativePlatform() === "android" && typeof PushNotifications.createChannel === "function") {
     await PushNotifications.createChannel({
       id: "schoolhop_activity",
@@ -2156,6 +2158,23 @@ async function registerNativePushToken() {
     state.nativePushListenerRegistered = true;
   }
   await PushNotifications.register();
+}
+
+async function androidFirebaseMessagingConfigured() {
+  if (state.androidFirebaseMessagingConfigured !== null) return state.androidFirebaseMessagingConfigured;
+  const { SchoolHopConfig } = nativePlugins();
+  if (!SchoolHopConfig || typeof SchoolHopConfig.getFirebaseMessagingStatus !== "function") {
+    state.androidFirebaseMessagingConfigured = false;
+    return false;
+  }
+  try {
+    const status = await SchoolHopConfig.getFirebaseMessagingStatus();
+    state.androidFirebaseMessagingConfigured = Boolean(status && status.configured);
+  } catch (error) {
+    reportClientError(error, { source: "android-firebase-config" });
+    state.androidFirebaseMessagingConfigured = false;
+  }
+  return state.androidFirebaseMessagingConfigured;
 }
 
 async function startNativeTracking(tripId) {

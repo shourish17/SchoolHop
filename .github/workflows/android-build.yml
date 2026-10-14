@@ -51,6 +51,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install Android SDK packages
         run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
@@ -89,6 +91,9 @@ jobs:
 
       - name: Sync Capacitor Android project
         run: npx cap sync android
+
+      - name: Apply Android push startup guard
+        run: node scripts/patch-capacitor-android-push.js
 
       - name: Verify Android manifest and version inputs
         run: |

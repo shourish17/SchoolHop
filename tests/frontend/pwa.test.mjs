@@ -272,11 +272,30 @@ test("iOS native location bridge uses background location only for active native
 test("Android native shell uses foreground service tracking and FCM registration", async () => {
   const app = await read("app/static/app.js");
   const manifest = await read("android/app/src/main/AndroidManifest.xml");
+  const mainActivity = await read("android/app/src/main/java/com/schoolhop/app/MainActivity.java");
+  const firebaseConfig = await read("android/app/src/main/java/com/schoolhop/app/SchoolHopFirebaseConfig.java");
+  const configPlugin = await read("android/app/src/main/java/com/schoolhop/app/SchoolHopConfigPlugin.java");
+  const pushPlugin = await read("android/app/src/main/java/com/schoolhop/app/SchoolHopPushNotificationsPlugin.java");
+  const patchScript = await read("scripts/patch-capacitor-android-push.js");
+  const androidWorkflow = await read(".github/workflows/android-build.yml");
   const plugin = await read("android/app/src/main/java/com/schoolhop/app/SchoolHopLocationPlugin.java");
   const service = await read("android/app/src/main/java/com/schoolhop/app/SchoolHopLocationService.java");
 
   assert.match(app, /provider: nativePlatform\(\) === "android" \? "fcm" : "apns"/);
   assert.match(app, /platform: nativePlatform\(\) === "android" \? "android" : "ios"/);
+  assert.match(app, /nativePlatform\(\) === "android" && !\(await androidFirebaseMessagingConfigured\(\)\)/);
+  assert.match(app, /SchoolHopConfig\.getFirebaseMessagingStatus\(\)/);
+  assert.match(mainActivity, /registerPlugin\(SchoolHopConfigPlugin\.class\)/);
+  assert.match(firebaseConfig, /google_app_id/);
+  assert.match(firebaseConfig, /gcm_defaultSenderId/);
+  assert.match(configPlugin, /@CapacitorPlugin\(name = "SchoolHopConfig"\)/);
+  assert.match(pushPlugin, /extends PushNotificationsPlugin/);
+  assert.match(pushPlugin, /Firebase Messaging is not configured for this Android build/);
+  assert.match(pushPlugin, /super\.register\(call\)/);
+  assert.match(pushPlugin, /catch \(IllegalStateException exception\)/);
+  assert.match(patchScript, /com\.capacitorjs\.plugins\.pushnotifications\.PushNotificationsPlugin/);
+  assert.match(patchScript, /com\.schoolhop\.app\.SchoolHopPushNotificationsPlugin/);
+  assert.match(androidWorkflow, /node scripts\/patch-capacitor-android-push\.js/);
   assert.match(manifest, /android\.permission\.ACCESS_BACKGROUND_LOCATION/);
   assert.match(manifest, /android\.permission\.FOREGROUND_SERVICE_LOCATION/);
   assert.match(manifest, /android:foregroundServiceType="location"/);

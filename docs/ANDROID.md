@@ -119,6 +119,10 @@ The app uses Capacitor Push Notifications. Android requires Firebase Cloud Messa
 5. Do not commit the real file.
 6. Configure the backend with FCM credentials. The current backend supports `provider=fcm` device tokens through `POST /api/mobile/devices` and sends via `FCM_SERVER_KEY`.
 
+Debug APKs are allowed to build and start without `android/app/google-services.json`. In that mode the Android shell detects that the generated Firebase resources (`google_app_id` and `gcm_defaultSenderId`) are unavailable and skips FCM registration; login, authentication, dashboard, GPS tracking, and other non-push features should continue to work. The guarded native push plugin also no-ops registration if JavaScript reaches it without Firebase configuration, preventing the `Default FirebaseApp is not initialized` startup crash.
+
+When a valid `google-services.json` is present, `npm run android:sync` applies the Google Services Gradle plugin, generates the Firebase resources, and routes Capacitor push registration through the guarded Android plugin into the stock Firebase Messaging implementation. Do not remove the guard when adding Firebase credentials; it is required so local and CI debug builds without credentials remain usable.
+
 The frontend registers:
 
 - iOS tokens as `provider=apns`, `platform=ios`;
@@ -256,7 +260,8 @@ Do not claim background GPS or push delivery works until tested on a real Androi
 
 ## Troubleshooting
 
-- Missing `google-services.json`: debug builds can still run, but FCM registration will not work.
+- Missing `google-services.json`: debug builds can still run, but Android FCM registration is skipped and no Android device token is sent to the backend.
+- Firebase push still unavailable after adding `google-services.json`: run `npm run android:sync`, confirm the file is at `android/app/google-services.json`, and rebuild so `google_app_id` and `gcm_defaultSenderId` are generated into the APK.
 - `platforms;android-36` missing: install it with Android Studio SDK Manager or `sdkmanager`.
 - Background location prompt unavailable: Android requires background location to be requested separately and may route users to Settings.
 - Release AAB skipped in Actions: configure all four Android signing secrets.
