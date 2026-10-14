@@ -43,6 +43,7 @@ const state = {
   knownNotificationIds: new Set(),
   notificationIdsSeeded: false,
   nativePushListenerRegistered: false,
+  nativeNotificationChannelsCreated: false,
 };
 
 const ROUTE_REFRESH_MS = 30000;
@@ -94,6 +95,11 @@ async function api(path, options = {}) {
 function apiUrl(path) {
   if (!isNativeApp || !nativeApiBaseUrl || !path.startsWith("/")) return path;
   return `${nativeApiBaseUrl}${path}`;
+}
+
+function nativePlatform() {
+  if (!isNativeApp || !window.Capacitor || typeof window.Capacitor.getPlatform !== "function") return "web";
+  return window.Capacitor.getPlatform();
 }
 
 function reportClientError(error, context = {}) {
@@ -2118,6 +2124,17 @@ async function registerNativePushToken() {
   if (!isNativeApp || !state.token) return;
   const { PushNotifications } = nativePlugins();
   if (!PushNotifications) return;
+  if (!state.nativeNotificationChannelsCreated && nativePlatform() === "android" && typeof PushNotifications.createChannel === "function") {
+    await PushNotifications.createChannel({
+      id: "schoolhop_activity",
+      name: "SchoolHop activity",
+      description: "Carpool assignments, trip updates, swaps, delays, and handovers.",
+      importance: 4,
+      visibility: 1,
+      sound: "default",
+    });
+    state.nativeNotificationChannelsCreated = true;
+  }
   const permission = await PushNotifications.requestPermissions();
   if (!permission || permission.receive !== "granted") return;
   if (!state.nativePushListenerRegistered) {
@@ -2126,7 +2143,11 @@ async function registerNativePushToken() {
       if (!value) return;
       await api("/api/mobile/devices", {
         method: "POST",
-        body: JSON.stringify({ provider: "apns", token: value, platform: "ios" }),
+        body: JSON.stringify({
+          provider: nativePlatform() === "android" ? "fcm" : "apns",
+          token: value,
+          platform: nativePlatform() === "android" ? "android" : "ios",
+        }),
       });
     });
     await PushNotifications.addListener("registrationError", (error) => {

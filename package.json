@@ -8,6 +8,9 @@
     "ios:build": "node scripts/build-capacitor-web.js",
     "ios:sync": "npm run ios:build && npx cap sync ios",
     "ios:open": "npx cap open ios",
+    "android:build": "npm run ios:build",
+    "android:sync": "npm run android:build && npx cap sync android",
+    "android:open": "npx cap open android",
     "lint": "eslint app/static/app.js app/static/service-worker.js tests/frontend/*.mjs",
     "test": "node --test tests/frontend/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json"
@@ -22,6 +25,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@capacitor/android": "^7.6.9",
     "@capacitor/app": "^7.1.2",
     "@capacitor/cli": "^7.6.9",
     "@capacitor/core": "^7.6.9",

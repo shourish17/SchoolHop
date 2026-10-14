@@ -6,7 +6,7 @@ const path = require("path");
 const root = path.resolve(__dirname, "..");
 const source = path.join(root, "app", "static");
 const destination = path.join(root, "build", "capacitor");
-const productionUrl = (process.env.SCHOOLHOP_IOS_API_BASE_URL || "https://schoolhop.shourish.com").replace(/\/$/, "");
+const productionUrl = (process.env.SCHOOLHOP_CAPACITOR_API_BASE_URL || process.env.SCHOOLHOP_IOS_API_BASE_URL || "https://schoolhop.shourish.com").replace(/\/$/, "");
 
 function copyDirectory(from, to) {
   fs.rmSync(to, { recursive: true, force: true });

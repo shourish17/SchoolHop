@@ -71,6 +71,12 @@ docker compose config --quiet
 
 GitHub Actions runs the same PWA/backend validation on pushes to `main`, pull requests, and manual dispatch. The workflow intentionally does not deploy SchoolHop; production deploys must be a separate, explicit operation.
 
+## Android Capacitor
+
+The maintained Android app is the root Capacitor project in `android/`, using application ID `com.schoolhop.app` and the existing PWA frontend/API contracts. It is separate from the archived React Native prototype in `mobile/schoolhop-mobile`.
+
+See [docs/ANDROID.md](docs/ANDROID.md) for local Android Studio setup, debug APK builds, background GPS behavior, Firebase/FCM setup, signing, GitHub Actions, Google Play Internal Testing preparation, policy declarations, and validation steps.
+
 ## MVP Journey
 
 1. Register with email verification or sign in as a parent.

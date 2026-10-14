@@ -269,6 +269,25 @@ test("iOS native location bridge uses background location only for active native
   assert.match(swift, /stopMonitoringSignificantLocationChanges\(\)/);
 });
 
+test("Android native shell uses foreground service tracking and FCM registration", async () => {
+  const app = await read("app/static/app.js");
+  const manifest = await read("android/app/src/main/AndroidManifest.xml");
+  const plugin = await read("android/app/src/main/java/com/schoolhop/app/SchoolHopLocationPlugin.java");
+  const service = await read("android/app/src/main/java/com/schoolhop/app/SchoolHopLocationService.java");
+
+  assert.match(app, /provider: nativePlatform\(\) === "android" \? "fcm" : "apns"/);
+  assert.match(app, /platform: nativePlatform\(\) === "android" \? "android" : "ios"/);
+  assert.match(manifest, /android\.permission\.ACCESS_BACKGROUND_LOCATION/);
+  assert.match(manifest, /android\.permission\.FOREGROUND_SERVICE_LOCATION/);
+  assert.match(manifest, /android:foregroundServiceType="location"/);
+  assert.match(manifest, /android:usesCleartextTraffic="false"/);
+  assert.match(plugin, /SchoolHop Android tracking requires an HTTPS API base URL/);
+  assert.match(service, /startForeground\(NOTIFICATION_ID, buildNotification\(\)\)/);
+  assert.match(service, /setMinUpdateDistanceMeters\(25\)/);
+  assert.match(service, /POST_THROTTLE_MS = 4000L/);
+  assert.ok(service.includes('"/api/trips/" + tripId + "/locations"'));
+});
+
 test("trip completion clears active GPS tracking in the PWA state", async () => {
   const app = await read("app/static/app.js");
 

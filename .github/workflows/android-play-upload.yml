@@ -1,0 +1,112 @@
+name: Android Play Internal Testing Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: GitHub Actions run ID containing the signed AAB artifact.
+        required: true
+        type: string
+      artifact_name:
+        description: Signed release AAB artifact name from Android Build.
+        required: true
+        type: string
+      package_name:
+        description: Google Play package name to validate before upload.
+        required: true
+        default: com.schoolhop.app
+        type: string
+      release_name:
+        description: Internal testing release name.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: schoolhop-android-play-upload
+  cancel-in-progress: false
+
+jobs:
+  internal-testing:
+    runs-on: ubuntu-latest
+    environment: google-play-internal-testing
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Verify Google Play credentials
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" ]; then
+            echo "::error::Missing GOOGLE_PLAY_SERVICE_ACCOUNT_JSON secret."
+            exit 1
+          fi
+
+      - name: Download signed AAB artifact
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          name: ${{ inputs.artifact_name }}
+          path: play-upload
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install bundletool
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/bundletool.jar" https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
+
+      - name: Validate AAB package and version
+        run: |
+          set -euo pipefail
+          AAB_PATH="$(find play-upload -name '*.aab' -type f | head -n 1)"
+          if [ -z "$AAB_PATH" ]; then
+            echo "::error::No AAB found in artifact ${{ inputs.artifact_name }}."
+            exit 1
+          fi
+          MANIFEST="$RUNNER_TEMP/aab-manifest.xml"
+          java -jar "$RUNNER_TEMP/bundletool.jar" dump manifest --bundle "$AAB_PATH" > "$MANIFEST"
+          grep -q "package=\"${{ inputs.package_name }}\"" "$MANIFEST"
+          VERSION_CODE="$(sed -n 's/.*android:versionCode=\"\\([0-9][0-9]*\\)\".*/\\1/p' "$MANIFEST" | head -n 1)"
+          VERSION_NAME="$(sed -n 's/.*android:versionName=\"\\([^\"]*\\)\".*/\\1/p' "$MANIFEST" | head -n 1)"
+          if [ -z "$VERSION_CODE" ]; then
+            echo "::error::Unable to read versionCode from AAB."
+            exit 1
+          fi
+          echo "AAB_PATH=$AAB_PATH" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "Validated package ${{ inputs.package_name }} versionCode $VERSION_CODE versionName $VERSION_NAME"
+
+      - name: Upload to Google Play Internal Testing
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.package_name }}
+          releaseFiles: ${{ env.AAB_PATH }}
+          track: internal
+          status: draft
+          releaseName: ${{ inputs.release_name || format('SchoolHop internal {0}', env.VERSION_CODE) }}
+
+      - name: Upload summary
+        run: |
+          {
+            echo "## Android Play Internal Testing Upload"
+            echo "- Package: \`${{ inputs.package_name }}\`"
+            echo "- Version code: \`$VERSION_CODE\`"
+            echo "- Version name: \`$VERSION_NAME\`"
+            echo "- Track: \`internal\`"
+            echo "- Status: \`draft\`"
+          } >> "$GITHUB_STEP_SUMMARY"

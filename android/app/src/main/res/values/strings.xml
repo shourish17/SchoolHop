@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">SchoolHop</string>
+    <string name="title_activity_main">SchoolHop</string>
+    <string name="package_name">com.schoolhop.app</string>
+    <string name="custom_url_scheme">schoolhop</string>
+    <string name="location_channel_name">Active trip location</string>
+    <string name="location_channel_description">Shows when an assigned driver is sharing active trip location.</string>
+    <string name="location_notification_title">SchoolHop trip tracking active</string>
+    <string name="location_notification_body">Location is shared only for this active driver trip.</string>
+</resources>
