@@ -1,0 +1,149 @@
+name: Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Android source commit, branch, or tag to build.
+        required: true
+        default: 8a17bf98af5a07ad9484db6c5c851af27b46236c
+        type: string
+      version_name:
+        description: Optional Android versionName override.
+        required: false
+        type: string
+      version_code:
+        description: Optional Android versionCode override. Defaults to the GitHub run number.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schoolhop-android-debug-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+jobs:
+  android-debug:
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: test
+      EXPOSE_DEVELOPMENT_VERIFICATION_CODES: "true"
+      EMAIL_PROVIDER: smtp
+      SMTP_HOST: ""
+      SMTP_FROM_EMAIL: ""
+      JWT_SECRET: test-only-ci-secret
+      DATABASE_URL: postgresql://schoolhop:schoolhop@localhost:5432/schoolhop
+      ANDROID_VERSION_NAME: ${{ inputs.version_name || '1.0.25' }}
+      ANDROID_VERSION_CODE: ${{ inputs.version_code || github.run_number }}
+    steps:
+      - name: Check out requested Android source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Record source commit
+        id: source
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
+          echo "Checked out source commit $SOURCE_SHA"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Run frontend typecheck
+        run: npm run typecheck
+
+      - name: Run frontend lint
+        run: npm run lint
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Run backend regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile backend modules
+        run: python -m py_compile app/main.py app/seed.py
+
+      - name: Build Capacitor web assets
+        run: npm run android:build
+
+      - name: Validate Capacitor config
+        run: npx cap config
+
+      - name: Sync Capacitor Android project
+        run: npx cap sync android
+
+      - name: Verify Android manifest and version inputs
+        run: |
+          set -euo pipefail
+          test -f android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.ACCESS_FINE_LOCATION' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.ACCESS_BACKGROUND_LOCATION' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.FOREGROUND_SERVICE_LOCATION' android/app/src/main/AndroidManifest.xml
+          grep -q 'android:foregroundServiceType="location"' android/app/src/main/AndroidManifest.xml
+          if ! [[ "$ANDROID_VERSION_CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::ANDROID_VERSION_CODE must be numeric."
+            exit 1
+          fi
+          echo "Commit SHA: $SOURCE_SHA"
+          echo "Application ID: com.schoolhop.app"
+          echo "Version name: $ANDROID_VERSION_NAME"
+          echo "Version code: $ANDROID_VERSION_CODE"
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: schoolhop-android-debug-${{ steps.source.outputs.sha }}
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Git diff whitespace check
+        run: git diff --check
+
+      - name: Build summary
+        run: |
+          {
+            echo "## Android Debug Build"
+            echo "- Source commit SHA: \`$SOURCE_SHA\`"
+            echo "- Application ID: \`com.schoolhop.app\`"
+            echo "- Version name: \`$ANDROID_VERSION_NAME\`"
+            echo "- Version code: \`$ANDROID_VERSION_CODE\`"
+            echo "- Debug APK artifact: \`schoolhop-android-debug-$SOURCE_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
