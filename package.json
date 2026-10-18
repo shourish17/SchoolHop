@@ -9,7 +9,7 @@
     "ios:sync": "npm run ios:build && npx cap sync ios",
     "ios:open": "npx cap open ios",
     "android:build": "npm run ios:build",
-    "android:sync": "npm run android:build && npx cap sync android && node scripts/patch-capacitor-android-push.js",
+    "android:sync": "node scripts/configure-android-firebase.js && npm run android:build && npx cap sync android && node scripts/patch-capacitor-android-push.js",
     "android:open": "npx cap open android",
     "lint": "eslint app/static/app.js app/static/service-worker.js tests/frontend/*.mjs tests/layout/*.mjs playwright.config.mjs",
     "test": "node --test tests/frontend/*.test.mjs",

@@ -43,6 +43,7 @@ const state = {
   knownNotificationIds: new Set(),
   notificationIdsSeeded: false,
   nativePushListenerRegistered: false,
+  nativePushSigningOut: false,
   nativeNotificationChannelsCreated: false,
   androidFirebaseMessagingConfigured: null,
 };
@@ -50,6 +51,8 @@ const state = {
 const ROUTE_REFRESH_MS = 30000;
 let notificationAudioContext = null;
 let notificationAudioElement = null;
+let nativePushQueue = Promise.resolve();
+let nativePushRegistration = null;
 
 const $ = (id) => document.getElementById(id);
 const nativeConfig = window.SCHOOLHOP_NATIVE_CONFIG || {};
@@ -74,7 +77,7 @@ function toast(message) {
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (state.token) headers.Authorization = `Bearer ${state.token}`;
+  if (state.token && !headers.Authorization) headers.Authorization = `Bearer ${state.token}`;
   const started = performance.now();
   const response = await fetch(apiUrl(path), { ...options, headers, cache: "no-store" });
   const text = await response.text();
@@ -546,7 +549,15 @@ function wireEvents() {
   $("tripDriver").addEventListener("change", () => {
     rememberRosterDriver($("tripDriver").value);
   });
-  $("logout").addEventListener("click", () => {
+  $("logout").addEventListener("click", async () => {
+    $("logout").disabled = true;
+    try {
+      await unregisterNativePushToken();
+    } catch {
+      toast("Could not unregister notifications. Connect to the internet and try Sign Out again.");
+      $("logout").disabled = false;
+      return;
+    }
     stopTracking();
     localStorage.removeItem("schoolhop_token");
     sessionStorage.removeItem("schoolhop_selected_trip");
@@ -558,8 +569,11 @@ function wireEvents() {
     stopLocationPolling();
     state.knownNotificationIds = new Set();
     state.notificationIdsSeeded = false;
+    state.pendingTab = null;
+    state.pendingSwapRequestId = null;
     toggleAuth("login");
-    refresh();
+    await refresh();
+    $("logout").disabled = false;
   });
   $("leaveGroup").addEventListener("click", leaveGroup);
   $("transferOwnership").addEventListener("click", transferOwnership);
@@ -616,6 +630,7 @@ function toggleAuth(mode) {
 }
 
 function setToken(token) {
+  state.nativePushSigningOut = false;
   state.token = token;
   state.knownNotificationIds = new Set();
   state.notificationIdsSeeded = false;
@@ -2083,13 +2098,16 @@ function resetNotificationSwipe() {
 async function openActionUrl(actionUrl) {
   if (!actionUrl) return;
   const url = new URL(actionUrl, window.location.origin);
+  const trustedOrigins = [window.location.origin, nativeApiBaseUrl, "https://schoolhop.shourish.com"].filter(Boolean);
+  if (url.username || url.password || (url.protocol !== "schoolhop:" && (!trustedOrigins.includes(url.origin) || url.pathname !== "/"))) return;
   const invite = url.searchParams.get("invite");
   if (invite) {
     state.pendingInviteToken = invite;
     localStorage.setItem("schoolhop_pending_invite", invite);
     const input = document.querySelector("#acceptInviteForm input[name='token']");
     if (input) input.value = invite;
-    setTab("group");
+    state.pendingTab = "group";
+    if (state.me) setTab("group");
     return;
   }
   const tripId = url.searchParams.get("trip");
@@ -2098,22 +2116,30 @@ async function openActionUrl(actionUrl) {
     rememberSelectedTrip(tripId);
     if ($("activeTrip")) $("activeTrip").value = state.selectedTripId;
     state.pendingSwapRequestId = swapRequestId;
-    await refreshSelectedTripActions();
   }
-  const tab = url.searchParams.get("tab");
-  if (tab) setTab(tab);
-  renderAll();
+  const tab = url.searchParams.get("tab") || (tripId ? "trip" : "alerts");
+  if (!["home", "group", "roster", "trip", "alerts", "account"].includes(tab)) return;
+  state.pendingTab = tab;
+  if (state.me) await refreshGroupContext();
 }
 
 function wireNativeEvents() {
   if (!isNativeApp) return;
   const { App, PushNotifications } = nativePlugins();
   if (App && typeof App.addListener === "function") {
+    App.addListener("appStateChange", (event) => {
+      if (event && event.isActive && state.token) {
+        registerNativePushToken(false).catch(() => reportClientError(new Error("Push registration failed"), { source: "native-push-resume" }));
+      }
+    });
     App.addListener("appUrlOpen", (event) => {
       if (event && event.url) openActionUrl(event.url).catch((error) => reportClientError(error, { source: "native-url-open" }));
     });
   }
   if (PushNotifications && typeof PushNotifications.addListener === "function") {
+    PushNotifications.addListener("pushNotificationReceived", () => {
+      if (state.token && !state.nativePushSigningOut) refreshGroupContext().catch(() => {});
+    });
     PushNotifications.addListener("pushNotificationActionPerformed", (event) => {
       const data = event && event.notification && event.notification.data ? event.notification.data : {};
       const actionUrl = data.action_url || data.url || "";
@@ -2134,8 +2160,14 @@ function wireNativeEvents() {
   }
 }
 
-async function registerNativePushToken() {
-  if (!isNativeApp || !state.token) return;
+async function registerNativePushToken(requestPermission = true) {
+  if (!isNativeApp || !state.token || state.nativePushSigningOut) return;
+  if (nativePushRegistration) return nativePushRegistration;
+  nativePushRegistration = configureNativePush(requestPermission);
+  try { await nativePushRegistration; } finally { nativePushRegistration = null; }
+}
+
+async function configureNativePush(requestPermission) {
   const { PushNotifications } = nativePlugins();
   if (!PushNotifications) return;
   if (nativePlatform() === "android" && !(await androidFirebaseMessagingConfigured())) return;
@@ -2145,32 +2177,68 @@ async function registerNativePushToken() {
       name: "SchoolHop activity",
       description: "Carpool assignments, trip updates, swaps, delays, and handovers.",
       importance: 4,
-      visibility: 1,
+      visibility: 0,
       sound: "default",
     });
     state.nativeNotificationChannelsCreated = true;
   }
-  const permission = await PushNotifications.requestPermissions();
-  if (!permission || permission.receive !== "granted") return;
+  const permission = requestPermission ? await PushNotifications.requestPermissions() : await PushNotifications.checkPermissions();
+  if (!permission || permission.receive !== "granted" || !state.token || state.nativePushSigningOut) return;
   if (!state.nativePushListenerRegistered) {
-    await PushNotifications.addListener("registration", async (token) => {
+    await PushNotifications.addListener("registration", (token) => {
       const value = token && (token.value || token.token);
-      if (!value) return;
-      await api("/api/mobile/devices", {
-        method: "POST",
-        body: JSON.stringify({
-          provider: nativePlatform() === "android" ? "fcm" : "apns",
-          token: value,
-          platform: nativePlatform() === "android" ? "android" : "ios",
-        }),
+      if (!value || !state.token || state.nativePushSigningOut) return;
+      const authorization = `Bearer ${state.token}`;
+      const device = {
+        provider: nativePlatform() === "android" ? "fcm" : "apns",
+        token: value,
+        platform: nativePlatform() === "android" ? "android" : "ios",
+      };
+      // Serialize token refresh and Sign Out; never register for a cleared account.
+      nativePushQueue = nativePushQueue.catch(() => {}).then(async () => {
+        let devices = JSON.parse(localStorage.getItem("schoolhop_push_devices") || "[]");
+        const previous = devices.filter((saved) => saved.provider !== device.provider || saved.token !== device.token);
+        devices = [...previous, device];
+        // Keep failed registrations/removals for retry and Sign Out cleanup.
+        localStorage.setItem("schoolhop_push_devices", JSON.stringify(devices));
+        await api("/api/mobile/devices", { method: "POST", headers: { Authorization: authorization }, body: JSON.stringify(device) });
+        for (const saved of previous) {
+          await api("/api/mobile/devices", { method: "DELETE", headers: { Authorization: authorization }, body: JSON.stringify(saved) });
+          devices = devices.filter((item) => item.provider !== saved.provider || item.token !== saved.token);
+          localStorage.setItem("schoolhop_push_devices", JSON.stringify(devices));
+        }
       });
+      nativePushQueue.catch(() => reportClientError(new Error("Push token registration failed"), { source: "native-push-registration" }));
+      return nativePushQueue.catch(() => {});
     });
-    await PushNotifications.addListener("registrationError", (error) => {
-      reportClientError(new Error(error && error.error ? error.error : "APNs registration failed"), { source: "native-push-registration" });
+    await PushNotifications.addListener("registrationError", () => {
+      reportClientError(new Error("Push notification registration failed"), { source: "native-push-registration" });
     });
     state.nativePushListenerRegistered = true;
   }
-  await PushNotifications.register();
+  if (!state.nativePushSigningOut && state.token) await PushNotifications.register();
+}
+
+async function unregisterNativePushToken() {
+  if (!isNativeApp) return;
+  state.nativePushSigningOut = true;
+  try {
+    if (nativePushRegistration) await nativePushRegistration;
+    await nativePushQueue.catch(() => {});
+    const devices = JSON.parse(localStorage.getItem("schoolhop_push_devices") || "[]");
+    for (const device of devices) {
+      await api("/api/mobile/devices", { method: "DELETE", body: JSON.stringify(device) });
+    }
+    const { PushNotifications } = nativePlugins();
+    if (PushNotifications) {
+      await PushNotifications.unregister();
+      await PushNotifications.removeAllDeliveredNotifications();
+    }
+    localStorage.removeItem("schoolhop_push_devices");
+  } catch (error) {
+    state.nativePushSigningOut = false;
+    throw error;
+  }
 }
 
 async function androidFirebaseMessagingConfigured() {

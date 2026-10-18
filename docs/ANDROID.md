@@ -148,29 +148,28 @@ Do not request unrestricted background tracking. Tracking must stay tied to an a
 
 ## Push Notifications
 
-The app uses Capacitor Push Notifications. Android requires Firebase Cloud Messaging:
+The app uses Capacitor Push Notifications with Firebase project `schoolhop-1c00d` and Android package `com.schoolhop.app`. The original configuration is stored outside Git at `/home/spela/google_android/google-services.json`.
 
-1. Create a Firebase project dedicated to SchoolHop.
-2. Add Android app package `com.schoolhop.app`.
-3. Download `google-services.json`.
-4. Place it at `android/app/google-services.json`.
-5. Do not commit the real file.
-6. Configure the backend with FCM credentials. The current backend supports `provider=fcm` device tokens through `POST /api/mobile/devices` and sends via `FCM_SERVER_KEY`.
+Build with the existing Firebase configuration:
 
-Debug APKs are allowed to build and start without `android/app/google-services.json`. In that mode the Android shell detects that the generated Firebase resources (`google_app_id` and `gcm_defaultSenderId`) are unavailable and skips FCM registration; login, authentication, dashboard, GPS tracking, and other non-push features should continue to work. The guarded native push plugin also no-ops registration if JavaScript reaches it without Firebase configuration, preventing the `Default FirebaseApp is not initialized` startup crash.
+```bash
+ANDROID_GOOGLE_SERVICES_FILE=/home/spela/google_android/google-services.json \
+ANDROID_REQUIRE_FIREBASE=true npm run android:sync
+cd android
+ANDROID_REQUIRE_FIREBASE=true ./gradlew --no-daemon assembleDebug
+```
 
-When a valid `google-services.json` is present, `npm run android:sync` applies the Google Services Gradle plugin, generates the Firebase resources, and routes Capacitor push registration through the guarded Android plugin into the stock Firebase Messaging implementation. Do not remove the guard when adding Firebase credentials; it is required so local and CI debug builds without credentials remain usable.
+The staging script validates the project/package and creates an ignored, mode-600 copy at `android/app/google-services.json`. It never logs its contents. Keep the original outside the repository. The Google Services Gradle plugin generates Firebase resources during the Gradle build.
 
-The frontend registers:
+GitHub Actions reads the encrypted `ANDROID_GOOGLE_SERVICES_JSON_BASE64` secret. Android Build requires it by default; its `require_firebase` input can be disabled for development builds without push. Missing configuration remains safe: both the frontend and guarded native plugin skip FCM registration, preventing the previous `Default FirebaseApp is not initialized` crash. Invalid supplied configuration fails validation rather than silently disabling push.
 
-- iOS tokens as `provider=apns`, `platform=ios`;
-- Android tokens as `provider=fcm`, `platform=android`.
+The backend now uses FCM HTTP v1 with server-only `FCM_SERVICE_ACCOUNT_PATH` and `FCM_PROJECT_ID=schoolhop-1c00d`. The old `FCM_SERVER_KEY` legacy sender is retired. The Android client JSON is **not** a backend service account credential. No production configuration has been changed.
 
-Android notification channel:
+Registration and refresh use authenticated `POST /api/mobile/devices`; Sign Out disables recorded tokens through authenticated `DELETE /api/mobile/devices` before clearing authentication and deleting the native token. If registered-device removal fails, Sign Out stays retryable and explains that a connection is needed. Builds that never registered a device can sign out offline.
 
-- `schoolhop_activity`: assignments, driver responses, swaps, trip starts, delays, handovers, and group/trip actions.
+Android uses the private `schoolhop_activity` notification channel. Push previews contain only a generic SchoolHop update; full details stay in the authenticated inbox. Taps use trusted `action_url` routes for trips, rosters, swaps, and invitations, including cold app launches and navigation pending login.
 
-Notification deep links use `action_url` data and route through the existing in-app notification action handler. Validate all notification URLs as relative SchoolHop paths or the trusted SchoolHop origin before expanding notification features.
+See [Android FCM integration report](ANDROID_FCM.md) for the audit, configured build-secret details, validation results, and Samsung Galaxy test checklist.
 
 ## Signing
 

@@ -44,7 +44,7 @@ Sample logins:
 - `ENVIRONMENT`, `EXPOSE_DEVELOPMENT_VERIFICATION_CODES`: allow local/test-only exposure of verification codes when email is not configured.
 - `EMAIL_PROVIDER=agentmail`, `AGENTMAIL_API_KEY`, `AGENTMAIL_FROM_EMAIL`: AgentMail delivery for account/security email only, including email verification and forgot/reset password.
 - `EMAIL_PROVIDER=smtp`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS`: SMTP fallback for the same account/security email workflow.
-- `FCM_SERVER_KEY`, `APNS_*`: reserved for production mobile push credentials, separate from Family AI.
+- `FCM_SERVICE_ACCOUNT_PATH`, `FCM_PROJECT_ID`, `APNS_*`: server-only mobile push configuration, separate from Family AI. See [Android FCM setup](docs/ANDROID_FCM.md).
 - `PUBLIC_SITE_URL`: canonical HTTPS URL for phone testing. Use `https://schoolhop.shourish.com`.
 - `GOOGLE_MAPS_BROWSER_KEY`: browser-visible Maps JavaScript API key. Restrict it to SchoolHop HTTP referrers such as `https://schoolhop.shourish.com/*`.
 - `GOOGLE_ROUTES_API_KEY`: server-side Routes API key. Keep it out of source control and browser responses.

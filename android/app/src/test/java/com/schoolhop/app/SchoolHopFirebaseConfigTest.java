@@ -4,8 +4,16 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.PluginMethod;
 
 public class SchoolHopFirebaseConfigTest {
+    @Test
+    public void guardedPushMethodsAreExportedToCapacitor() throws Exception {
+        assertTrue(SchoolHopPushNotificationsPlugin.class.getMethod("register", PluginCall.class).isAnnotationPresent(PluginMethod.class));
+        assertTrue(SchoolHopPushNotificationsPlugin.class.getMethod("unregister", PluginCall.class).isAnnotationPresent(PluginMethod.class));
+    }
+
     @Test
     public void missingFirebaseValuesDisableMessaging() {
         assertFalse(SchoolHopFirebaseConfig.hasRequiredFirebaseValues("", ""));

@@ -37,7 +37,8 @@ class Settings(BaseSettings):
     raw_location_retention_minutes: int = 120
     location_stale_seconds: int = 240
     safety_timeout_minutes: int = 180
-    fcm_server_key: str | None = None
+    fcm_project_id: str = "schoolhop-1c00d"
+    fcm_service_account_path: str | None = None
     apns_key_id: str | None = None
     apns_team_id: str | None = None
     apns_bundle_id: str | None = None
@@ -511,23 +512,60 @@ def apns_private_key() -> str | None:
     return None
 
 
+_fcm_access_token: tuple[str, str, float] | None = None
+_fcm_token_lock = asyncio.Lock()
+
+
+async def fcm_access_token(client: httpx.AsyncClient) -> str:
+    """Exchange a server-only service account assertion for a cached OAuth token."""
+    global _fcm_access_token
+    async with _fcm_token_lock:
+        now = time_module.time()
+        if _fcm_access_token and _fcm_access_token[0] == settings.fcm_service_account_path and _fcm_access_token[2] > now + 60:
+            return _fcm_access_token[1]
+        credentials = json.loads(Path(settings.fcm_service_account_path).read_text())
+        assertion = jwt.encode(
+            {
+                "iss": credentials["client_email"],
+                "scope": "https://www.googleapis.com/auth/firebase.messaging",
+                "aud": "https://oauth2.googleapis.com/token",
+                "iat": int(now),
+                "exp": int(now) + 3600,
+            },
+            credentials["private_key"],
+            algorithm="RS256",
+        )
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+        )
+        response.raise_for_status()
+        result = response.json()
+        _fcm_access_token = (settings.fcm_service_account_path, result["access_token"], now + int(result["expires_in"]))
+        return result["access_token"]
+
+
 async def send_push_to_device(device: asyncpg.Record, title: str, body: str, data: dict[str, str]) -> None:
+    # Detailed activity remains behind authentication, never in lock-screen previews.
+    title, body = "SchoolHop", "You have a new SchoolHop update. Open the app to view it."
     if device["provider"] == "fcm":
-        if not settings.fcm_server_key:
+        if not settings.fcm_service_account_path:
             return
         async with httpx.AsyncClient(timeout=8) as client:
+            access_token = await fcm_access_token(client)
             response = await client.post(
-                "https://fcm.googleapis.com/fcm/send",
-                headers={
-                    "Authorization": f"key={settings.fcm_server_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "to": device["token"],
+                f"https://fcm.googleapis.com/v1/projects/{settings.fcm_project_id}/messages:send",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"message": {
+                    "token": device["token"],
                     "notification": {"title": title, "body": body},
                     "data": data,
-                    "priority": "high",
-                },
+                    "android": {
+                        "priority": "high",
+                        "restricted_package_name": "com.schoolhop.app",
+                        "notification": {"channel_id": "schoolhop_activity", "visibility": "PRIVATE", "sound": "default"},
+                    },
+                }},
             )
             response.raise_for_status()
         return
@@ -577,16 +615,32 @@ async def deliver_push(
         "kind": kind,
         "entity_type": entity_type or "",
         "entity_id": str(entity_id) if entity_id else "",
-        "action_url": action_url or "",
+        "action_url": action_url or (f"/?tab=trip&trip={entity_id}" if entity_type == "trip" and entity_id else "/?tab=group" if entity_type == "group" else "/?tab=alerts"),
     }
     for device in devices:
         try:
             await send_push_to_device(device, title, body, data)
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in {400, 403, 404, 410}:
+            if device["provider"] == "fcm":
+                try:
+                    details = exc.response.json().get("error", {}).get("details", [])
+                    invalid_token = any(
+                        detail.get("@type") == "type.googleapis.com/google.firebase.fcm.v1.FcmError"
+                        and detail.get("errorCode") == "UNREGISTERED"
+                        for detail in details
+                    )
+                except (ValueError, AttributeError, TypeError):
+                    invalid_token = False
+                if exc.response.status_code == 401:
+                    global _fcm_access_token
+                    _fcm_access_token = None
+            else:
+                invalid_token = exc.response.status_code in {400, 410}
+            if invalid_token:
                 await database.execute("UPDATE mobile_devices SET enabled = false WHERE id = $1", device["id"])
-        except (httpx.HTTPError, jwt.PyJWTError):
-            continue
+            logging.warning("Push provider %s returned HTTP %s", device["provider"], exc.response.status_code)
+        except (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, KeyError, TypeError):
+            logging.warning("Push provider %s delivery failed", device["provider"])
 
 
 async def notify(
@@ -1931,6 +1985,15 @@ async def register_mobile_device(payload: MobileDeviceIn, user: UserDep, databas
     )
     await audit(database, user["id"], "mobile_device.registered", details={"provider": payload.provider, "platform": payload.platform})
     return row_to_dict(row) or {}
+
+
+@app.delete("/api/mobile/devices")
+async def unregister_mobile_device(payload: MobileDeviceIn, user: UserDep, database: DbDep) -> dict[str, str]:
+    await database.execute(
+        "UPDATE mobile_devices SET enabled = false WHERE user_id = $1 AND provider = $2 AND token = $3",
+        UUID(user["id"]), payload.provider, payload.token,
+    )
+    return {"status": "unregistered"}
 
 
 @app.get("/api/schools")

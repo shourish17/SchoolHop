@@ -10,6 +10,12 @@
 .netrc
 secrets/
 credentials/
+google-services.json
+*service-account*.json
+*service_account*.json
+*serviceAccount*.json
+*firebase-adminsdk*.json
+application_default_credentials.json
 
 # Keys and certificates
 *.pem
