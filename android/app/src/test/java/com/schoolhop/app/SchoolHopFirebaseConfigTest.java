@@ -10,8 +10,10 @@ import com.getcapacitor.PluginMethod;
 public class SchoolHopFirebaseConfigTest {
     @Test
     public void guardedPushMethodsAreExportedToCapacitor() throws Exception {
-        assertTrue(SchoolHopPushNotificationsPlugin.class.getMethod("register", PluginCall.class).isAnnotationPresent(PluginMethod.class));
-        assertTrue(SchoolHopPushNotificationsPlugin.class.getMethod("unregister", PluginCall.class).isAnnotationPresent(PluginMethod.class));
+        for (String method : new String[] { "register", "unregister", "checkPermissions", "requestPermissions", "createChannel" }) {
+            assertTrue(SchoolHopPushNotificationsPlugin.class.getDeclaredMethod(method, PluginCall.class).isAnnotationPresent(PluginMethod.class));
+        }
+        assertTrue(SchoolHopConfigPlugin.class.getDeclaredMethod("getNotificationDiagnostics", PluginCall.class).isAnnotationPresent(PluginMethod.class));
     }
 
     @Test

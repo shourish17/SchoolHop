@@ -2178,7 +2178,6 @@ async function configureNativePush(requestPermission) {
       description: "Carpool assignments, trip updates, swaps, delays, and handovers.",
       importance: 4,
       visibility: 0,
-      sound: "default",
     });
     state.nativeNotificationChannelsCreated = true;
   }

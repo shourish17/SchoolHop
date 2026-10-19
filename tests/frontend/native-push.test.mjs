@@ -56,6 +56,17 @@ test("push safely skips Firebase-free builds and denied permission", async () =>
   }
 });
 
+test("Android channel keeps high importance and uses the platform default sound", async () => {
+  const h = pushHarness();
+  await h.context.registerNativePushToken();
+  const [, channel] = h.calls.find(([kind]) => kind === "channel");
+  assert.equal(channel.id, "schoolhop_activity");
+  assert.equal(channel.importance, 4);
+  assert.equal(channel.visibility, 0);
+  // Capacitor treats a supplied sound as an app raw resource, including "default".
+  assert.equal(Object.hasOwn(channel, "sound"), false);
+});
+
 test("token refresh registers the new token, removes the old token and signs out in order", async () => {
   const h = pushHarness();
   await h.context.registerNativePushToken();
