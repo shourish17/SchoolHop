@@ -661,7 +661,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 async def fetch_with_devices(query, *args):
                     if "mobile_devices" in query:
                         self.assertIn("user_id = $1 AND enabled = true", query)
-                        return [{"provider": "fcm", "token": "test-only-device", "user_id": args[0]}]
+                        return [{"id": uuid4(), "provider": "fcm", "token": "test-only-device", "user_id": args[0], "last_seen_at": datetime.now(UTC)}]
                     return await original_fetch(query, *args)
 
                 user = {"id": str(ids.driver_id), "name": "Driver"}
@@ -1584,11 +1584,11 @@ class TripActionDatabase:
     def acquire(self):
         return AsyncContext(self)
 
-    def transaction(self):
+    def transaction(self, **kwargs):
         return AsyncContext(self)
 
     async def fetchrow(self, query, *args):
-        if "SELECT * FROM trips WHERE id" in query:
+        if "SELECT * FROM trips WHERE id" in query or "SELECT id FROM trips WHERE id" in query:
             return self.trip
         if "FROM group_members" in query:
             role = "creator" if args[1] == self.ids.organiser_id else "member"

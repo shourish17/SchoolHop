@@ -73,6 +73,48 @@ response bodies.
   disabled. Database cleanup/lookup failures and provider failures leave the Alerts
   row intact and do not prevent attempts to subsequent devices, including APNs.
 
+## Registration and swap concurrency
+
+Every initial FCM POST and retry revalidates the original registration ID, user,
+provider, exact token, `last_seen_at`, and `enabled=true` in a fresh PostgreSQL
+READ COMMITTED transaction. A `SELECT ... FOR SHARE` holds the matching row through
+that single HTTP attempt. PostgreSQL's ordinary UPDATE/UPSERT/DELETE row locks make
+reassignment, registration refresh, logout, and account-deletion updates wait until
+the attempt releases the row. If a mutation wins the lock first, the waiting
+validation rechecks the updated row and cancels the stale attempt. No process-local
+lock is used to coordinate different API workers.
+
+The lock is released before retry backoff and is never held during OAuth exchange.
+Lock/pool waits are inside the existing 45-second per-device deadline. An updated,
+disabled, deleted, or reassigned registration cancels all remaining attempts for
+that snapshot. An unavailable validation database fails closed. Direct FCM sending
+without a registration guard also fails closed. The compare-and-disable cleanup
+query remains tied to the exact failed snapshot.
+
+An already submitted request cannot be recalled. A registration update that arrives
+while a request is in flight waits for that attempt; Firebase can accept or display
+the old notification before or after logout completes. Provider-side queued messages
+cannot be cancelled by these database locks. Existing preview privacy and endpoint
+authorization remain necessary. Refresh may suppress an old snapshot's notification;
+there is no durable replay to the refreshed registration. A slow request may delay
+registration/logout until the current attempt ends, within the remaining deadline.
+
+Swap creation uses a PostgreSQL READ COMMITTED transaction and locks the parent
+trip row `FOR UPDATE` before checking permission/current trip state, checking for
+an open swap, and inserting. The uniqueness scope is **one open swap per trip**,
+regardless of the proposed replacement driver. A concurrent loser sees the winning
+committed request and returns HTTP 409 before any notification dispatch. Completed,
+declined, or cancelled swap history does not block a new request, and unrelated
+trips do not share a lock. Notifications are sent only after the insert transaction
+commits, using the existing recipients, routes, and request-based idempotency keys.
+
+This uses transactional serialization, not a new database constraint or migration.
+All swap-creation writers must follow this protocol; do not mix old and new API
+workers during a future rollout. Existing duplicate rows are not modified or
+automatically pruned. Manual SQL that bypasses the API is outside this guarantee.
+See [PostgreSQL row locks](https://www.postgresql.org/docs/17/explicit-locking.html#LOCKING-ROWS)
+and [READ COMMITTED](https://www.postgresql.org/docs/17/transaction-iso.html#XACT-READ-COMMITTED).
+
 Push remains best effort and is awaited by the existing pipeline: an outage can add
 up to 45 seconds per FCM device to an event request. A 5xx response can still
 leave acceptance ambiguous, so retry delivery is not exactly once. Existing
@@ -195,7 +237,7 @@ container; the post-deployment inspection above verifies the eventual live mount
 
 ## Offline validation
 
-Backend tests use fake credentials, mocked HTTP responses, and fake database objects.
+Default backend tests use fake credentials, mocked HTTP responses, and fake database objects.
 They do not read the existing server credential, access production PostgreSQL, send
 FCM/APNs requests, or start containers. Coverage includes OAuth caching and refresh,
 credential validation, channel/TTL/privacy, event routes and recipient scoping,
@@ -216,7 +258,34 @@ excludes common credential/key files inside those directories. The Dockerfile co
 only requirements, application source, and migrations. No image was built as part
 of this validation.
 
-Validation results: 113 backend tests passed (40 FCM tests), 29 frontend tests
-passed, and frontend typechecking/lint, Python compilation, both Compose variants,
-and `git diff --check` passed. All provider and database interactions in backend
-tests were mocked.
+Concurrency validation additionally uses `tests/test_notification_concurrency.py`
+and `tests/test_postgres_notification_concurrency.py`. The latter is opt-in: set
+`SCHOOLHOP_TEST_PG_SOCKET` to `/tmp/schoolhop-fcm-concurrency-pg-<unique>/socket`
+for a disposable PostgreSQL 17 instance. It refuses other socket locations and uses
+only database `schoolhop_fcm_concurrency_test`, with randomly named temporary
+schemas. It never accepts a production DSN or TCP host. The ordinary suite skips
+these real-PostgreSQL tests unless that explicit test socket is supplied. Both
+providers and OAuth credentials remain mocked in every test.
+
+The PostgreSQL tests exercise actual conflicting row locks across separate pool
+connections. They use events and observed blocked database queries, rather than
+timing-dependent sleeps, to reproduce reassignment/logout/refresh during delivery
+and two simultaneous swap submissions. They also check cleanup comparisons, a
+validation-lock timeout, different replacement drivers, independent trips, closed
+swap history, and exact mocked notification counts.
+
+The original concurrency reproductions now assert that reassignment cancels the
+retry (one POST), and two overlapping swaps produce one success, one HTTP 409, and
+two recipient sends. A default-suite swap concurrency test exercises the same
+winner/loser behavior without requiring PostgreSQL.
+
+Validation after the concurrency fixes: 128 backend tests passed with the optional
+seven PostgreSQL tests enabled, 29 frontend tests passed, seven layout tests passed,
+and typechecking, lint, Python compilation, both Compose variants, and whitespace
+checks passed. Backend TCP connections were blocked; only the isolated temporary
+PostgreSQL Unix socket was allowed. The PostgreSQL 17 test container used tmpfs
+database storage, no network, and no production volumes or credentials. It was
+removed after validation. APNs, registration/unregistration, OAuth caching, cleanup
+classification, other event handlers, and swap dispatch/idempotency bodies were
+also compared structurally against the previous commit. No schema migration or
+production deployment was performed.

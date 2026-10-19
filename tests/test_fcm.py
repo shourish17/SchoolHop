@@ -2,6 +2,7 @@ import asyncio
 import json
 import unittest
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from uuid import uuid4
 import httpx
 
 import app.main as main
+from notification_test_support import RegistrationDatabase
 
 
 class FirebasePushTests(unittest.IsolatedAsyncioTestCase):
@@ -27,7 +29,7 @@ class FirebasePushTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.settings, "fcm_service_account_path", "/external/credentials.json"), patch.object(
             main, "fcm_access_token", new=AsyncMock(return_value="oauth-token")
         ), patch.object(main.httpx, "AsyncClient", return_value=client):
-            await main.send_push_to_device({"provider": "fcm", "token": "device-token"}, "Child Name picked up", "Private address", {"action_url": "/?tab=trip&trip=trip-id"})
+            await main.send_push_to_device({"provider": "fcm", "token": "device-token"}, "Child Name picked up", "Private address", {"action_url": "/?tab=trip&trip=trip-id"}, registration_guard=lambda: nullcontext(True))
         args, kwargs = client.post.call_args
         self.assertEqual(args[0], "https://fcm.googleapis.com/v1/projects/schoolhop-1c00d/messages:send")
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer oauth-token")
@@ -98,7 +100,7 @@ class FirebasePushTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(kind=kind):
                 entity_type = "invitation" if kind == "invitation" else "trip"
                 entity_id = uuid4()
-                device = {"provider": "fcm", "token": "device-token"}
+                device = {"id": uuid4(), "provider": "fcm", "token": "device-token", "last_seen_at": datetime.now(UTC)}
                 database = SimpleNamespace(fetch=AsyncMock(return_value=[device]), fetchrow=AsyncMock(return_value={"id": uuid4()}))
                 with patch.object(main, "send_push_to_device", new=AsyncMock()) as send:
                     await main.notify(database, uuid4(), kind, "title", "body", entity_type, entity_id, action_url="/?invite=test-code" if kind == "invitation" else None)
@@ -127,8 +129,9 @@ class FirebaseReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.client.post.return_value = provider_response(200)
         self.device = {"id": uuid4(), "provider": "fcm", "token": "PRIVATE_DEVICE_CANARY", "last_seen_at": datetime.now(UTC)}
         self.user_id = uuid4()
+        guard_database = RegistrationDatabase({**self.device, "user_id": self.user_id, "enabled": True})
         self.database = SimpleNamespace(fetch=AsyncMock(return_value=[self.device]), execute=AsyncMock(),
-                                        fetchrow=AsyncMock(return_value={"id": uuid4()}))
+                                        fetchrow=AsyncMock(return_value={"id": uuid4()}), acquire=guard_database.acquire)
         for patcher in [
             patch.object(main.settings, "fcm_service_account_path", "/fake/service-account.json"),
             patch.object(main, "_fcm_access_token", None),
@@ -141,7 +144,7 @@ class FirebaseReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
 
     async def send(self):
-        await main.send_push_to_device(self.device, "PRIVATE_CHILD_CANARY", "PRIVATE_ADDRESS_CANARY", {})
+        await main.send_push_to_device(self.device, "PRIVATE_CHILD_CANARY", "PRIVATE_ADDRESS_CANARY", {}, registration_guard=lambda: nullcontext(True))
 
     async def notify(self):
         await main.notify(self.database, self.user_id, "handover", "Private child picked up", "Private address", "trip", uuid4())

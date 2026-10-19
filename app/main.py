@@ -7,12 +7,12 @@ import logging
 import secrets
 import smtplib
 import time as time_module
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, date, datetime, time, timedelta
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, AsyncContextManager, Callable
 from uuid import UUID
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -519,13 +519,41 @@ FCM_DELIVERY_TIMEOUT_SECONDS = 45
 FCM_MAX_ATTEMPTS = 3
 
 
-async def fcm_post(client: httpx.AsyncClient, url: str, *, deadline: float, **kwargs: Any) -> httpx.Response:
+class PushRegistrationChanged(Exception):
+    """The selected registration is no longer current; do not send or retry."""
+
+
+@asynccontextmanager
+async def fcm_registration_guard(database: asyncpg.Pool, snapshot: tuple[Any, ...]):
+    # FOR SHARE also conflicts with non-key UPDATEs (logout/owner/last_seen_at).
+    # Hold only during one HTTP attempt, never during OAuth or retry backoff.
+    async with database.acquire() as conn:
+        async with conn.transaction(isolation="read_committed"):
+            current = await conn.fetchval(
+                """
+                SELECT id FROM mobile_devices
+                WHERE id = $1 AND user_id = $2 AND provider = $3 AND token = $4
+                  AND last_seen_at = $5 AND enabled = true
+                FOR SHARE
+                """,
+                *snapshot,
+            )
+            yield current is not None
+
+
+async def fcm_post(
+    client: httpx.AsyncClient, url: str, *, deadline: float,
+    attempt_guard: Callable[[], AsyncContextManager[bool]] | None = None, **kwargs: Any,
+) -> httpx.Response:
     """Bounded best-effort retries; never shorten a provider's Retry-After."""
     async with asyncio.timeout_at(deadline):
         for attempt in range(FCM_MAX_ATTEMPTS):
             response = None
             try:
-                response = await client.post(url, **kwargs)
+                async with (attempt_guard() if attempt_guard else nullcontext(True)) as current:
+                    if not current:
+                        raise PushRegistrationChanged()
+                    response = await client.post(url, **kwargs)
                 response.raise_for_status()
                 return response
             except httpx.HTTPStatusError:
@@ -616,12 +644,17 @@ async def fcm_access_token(client: httpx.AsyncClient, *, deadline: float | None 
         return result["access_token"]
 
 
-async def send_push_to_device(device: asyncpg.Record, title: str, body: str, data: dict[str, str]) -> None:
+async def send_push_to_device(
+    device: asyncpg.Record, title: str, body: str, data: dict[str, str], *,
+    registration_guard: Callable[[], AsyncContextManager[bool]] | None = None,
+) -> None:
     # Detailed activity remains behind authentication, never in lock-screen previews.
     title, body = "SchoolHop", "You have a new SchoolHop update. Open the app to view it."
     if device["provider"] == "fcm":
         if not settings.fcm_service_account_path:
             return
+        if registration_guard is None:
+            raise ValueError("FCM delivery requires a registration guard")
         deadline = time_module.monotonic() + FCM_DELIVERY_TIMEOUT_SECONDS
         async with asyncio.timeout_at(deadline), httpx.AsyncClient(timeout=10) as client:
             access_token = await fcm_access_token(client, deadline=deadline)
@@ -630,6 +663,7 @@ async def send_push_to_device(device: asyncpg.Record, title: str, body: str, dat
                     client,
                     f"https://fcm.googleapis.com/v1/projects/{settings.fcm_project_id}/messages:send",
                     deadline=deadline,
+                    attempt_guard=registration_guard,
                     headers={"Authorization": f"Bearer {access_token}"},
                     json={"message": {
                         "token": device["token"],
@@ -704,7 +738,16 @@ async def deliver_push(
     }
     for device in devices:
         try:
-            await send_push_to_device(device, title, body, data)
+            if device["provider"] == "fcm":
+                snapshot = (device["id"], UUID(str(user_id)), device["provider"], device["token"], device["last_seen_at"])
+                await send_push_to_device(
+                    device, title, body, data,
+                    registration_guard=lambda snapshot=snapshot: fcm_registration_guard(database, snapshot),
+                )
+            else:
+                await send_push_to_device(device, title, body, data)
+        except PushRegistrationChanged:
+            logger.info("Push registration changed; delivery cancelled")
         except httpx.HTTPStatusError as exc:
             if device["provider"] == "fcm":
                 invalid_token = fcm_token_is_invalid(exc.response)
@@ -720,7 +763,7 @@ async def deliver_push(
                 except asyncpg.PostgresError:
                     logger.warning("Push invalid-token cleanup failed")
             logging.warning("Push provider %s returned HTTP %s", device["provider"], exc.response.status_code)
-        except (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, KeyError, TypeError, TimeoutError):
+        except (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, KeyError, TypeError, TimeoutError, asyncpg.PostgresError, asyncpg.InterfaceError):
             logging.warning("Push provider %s delivery failed", device["provider"])
 
 
@@ -3074,60 +3117,66 @@ async def eligible_swap_drivers(trip_id: UUID, user: UserDep, database: DbDep) -
 
 @app.post("/api/trips/{trip_id}/change-requests")
 async def request_roster_change(trip_id: UUID, payload: ChangeRequestIn, user: UserDep, database: DbDep) -> dict[str, Any]:
-    trip = await trip_with_permission(database, user["id"], trip_id)
-    if payload.request_type == "swap":
-        if trip["driver_user_id"] != UUID(user["id"]):
-            raise HTTPException(status_code=403, detail="Only the assigned driver can request a swap")
-        if trip["status"] not in {"planned", "delayed"}:
-            raise HTTPException(status_code=409, detail="Swap requests are only available before a trip starts")
-        if not payload.proposed_driver_user_id:
-            raise HTTPException(status_code=400, detail="Choose a proposed replacement driver")
-        if payload.proposed_driver_user_id == trip["driver_user_id"]:
-            raise HTTPException(status_code=400, detail="Choose a different replacement driver")
-        existing_open_swap = await database.fetchval(
-            """
-            SELECT 1
-            FROM roster_change_requests
-            WHERE trip_id = $1 AND request_type = 'swap' AND status = 'open'
-            LIMIT 1
-            """,
-            trip_id,
-        )
-        if existing_open_swap:
-            raise HTTPException(status_code=409, detail="A swap request is already open for this trip")
-    if payload.proposed_driver_user_id:
-        await require_group_member(database, payload.proposed_driver_user_id, trip["group_id"])
-        missing_approval = await database.fetchval(
-            """
-            SELECT 1
-            FROM trip_children tc
-            LEFT JOIN driver_approvals da
-              ON da.group_id = $1
-             AND da.child_id = tc.child_id
-             AND da.driver_user_id = $2
-             AND da.approved = true
-            WHERE tc.trip_id = $3
-              AND da.id IS NULL
-            LIMIT 1
-            """,
-            trip["group_id"],
-            payload.proposed_driver_user_id,
-            trip_id,
-        )
-        if missing_approval:
-            raise HTTPException(status_code=403, detail="Proposed driver is not approved for every child on this trip")
-    row = await database.fetchrow(
-        """
-        INSERT INTO roster_change_requests (trip_id, requested_by, request_type, proposed_driver_user_id, note)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING *
-        """,
-        trip_id,
-        UUID(user["id"]),
-        payload.request_type,
-        payload.proposed_driver_user_id,
-        payload.note,
-    )
+    async with database.acquire() as conn:
+        # A fresh READ COMMITTED snapshot after waiting for the trip lock sees
+        # the winning request. One open swap per trip, regardless of replacement.
+        async with conn.transaction(isolation="read_committed"):
+            if payload.request_type == "swap":
+                await conn.fetchrow("SELECT id FROM trips WHERE id = $1 FOR UPDATE", trip_id)
+            trip = await trip_with_permission(conn, user["id"], trip_id)
+            if payload.request_type == "swap":
+                if trip["driver_user_id"] != UUID(user["id"]):
+                    raise HTTPException(status_code=403, detail="Only the assigned driver can request a swap")
+                if trip["status"] not in {"planned", "delayed"}:
+                    raise HTTPException(status_code=409, detail="Swap requests are only available before a trip starts")
+                if not payload.proposed_driver_user_id:
+                    raise HTTPException(status_code=400, detail="Choose a proposed replacement driver")
+                if payload.proposed_driver_user_id == trip["driver_user_id"]:
+                    raise HTTPException(status_code=400, detail="Choose a different replacement driver")
+                existing_open_swap = await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM roster_change_requests
+                    WHERE trip_id = $1 AND request_type = 'swap' AND status = 'open'
+                    LIMIT 1
+                    """,
+                    trip_id,
+                )
+                if existing_open_swap:
+                    raise HTTPException(status_code=409, detail="A swap request is already open for this trip")
+            if payload.proposed_driver_user_id:
+                await require_group_member(conn, payload.proposed_driver_user_id, trip["group_id"])
+                missing_approval = await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM trip_children tc
+                    LEFT JOIN driver_approvals da
+                      ON da.group_id = $1
+                     AND da.child_id = tc.child_id
+                     AND da.driver_user_id = $2
+                     AND da.approved = true
+                    WHERE tc.trip_id = $3
+                      AND da.id IS NULL
+                    LIMIT 1
+                    """,
+                    trip["group_id"],
+                    payload.proposed_driver_user_id,
+                    trip_id,
+                )
+                if missing_approval:
+                    raise HTTPException(status_code=403, detail="Proposed driver is not approved for every child on this trip")
+            row = await conn.fetchrow(
+                """
+                INSERT INTO roster_change_requests (trip_id, requested_by, request_type, proposed_driver_user_id, note)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+                """,
+                trip_id,
+                UUID(user["id"]),
+                payload.request_type,
+                payload.proposed_driver_user_id,
+                payload.note,
+            )
     request_id = row["id"]
     if trip["created_by"] != UUID(user["id"]):
         await notify(
