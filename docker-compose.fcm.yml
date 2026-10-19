@@ -1,0 +1,11 @@
+# Opt-in runtime secret mount. Use only during a separately approved deployment.
+services:
+  api:
+    environment:
+      FCM_SERVICE_ACCOUNT_PATH: /run/secrets/schoolhop_fcm_service_account
+    secrets:
+      - schoolhop_fcm_service_account
+
+secrets:
+  schoolhop_fcm_service_account:
+    file: ${FCM_SERVICE_ACCOUNT_FILE:?Set the existing external service-account file path}

@@ -10,6 +10,7 @@ import time as time_module
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
@@ -514,9 +515,72 @@ def apns_private_key() -> str | None:
 
 _fcm_access_token: tuple[str, str, float] | None = None
 _fcm_token_lock = asyncio.Lock()
+FCM_DELIVERY_TIMEOUT_SECONDS = 45
+FCM_MAX_ATTEMPTS = 3
 
 
-async def fcm_access_token(client: httpx.AsyncClient) -> str:
+async def fcm_post(client: httpx.AsyncClient, url: str, *, deadline: float, **kwargs: Any) -> httpx.Response:
+    """Bounded best-effort retries; never shorten a provider's Retry-After."""
+    async with asyncio.timeout_at(deadline):
+        for attempt in range(FCM_MAX_ATTEMPTS):
+            response = None
+            try:
+                response = await client.post(url, **kwargs)
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError:
+                if response.status_code not in {429, 500, 502, 503, 504}:
+                    raise
+                retry_after = 0.0
+                header = response.headers.get("Retry-After")
+                if header:
+                    try:
+                        retry_after = max(0, int(header))
+                    except ValueError:
+                        try:
+                            retry_after = max(0, parsedate_to_datetime(header).timestamp() - time_module.time())
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+                minimum = 60 if response.status_code == 429 else 10
+                delay = max(minimum * 2**attempt, retry_after) + secrets.randbelow(1000) / 1000
+                # Leave time for one request. Quota/long backoffs exceed the inline
+                # budget: abandon this push rather than retrying before permitted.
+                if attempt + 1 == FCM_MAX_ATTEMPTS or delay + 10 > deadline - time_module.monotonic():
+                    raise
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                # These failures precede submission. Read/write/protocol failures
+                # can occur after acceptance, so never blindly resend those.
+                delay = 10 * 2**attempt + secrets.randbelow(1000) / 1000
+                if attempt + 1 == FCM_MAX_ATTEMPTS or delay + 10 > deadline - time_module.monotonic():
+                    raise
+            logger.warning("FCM retry attempt=%s http_status=%s delay_seconds=%.1f", attempt + 2, response.status_code if response is not None else 0, delay)
+            await asyncio.sleep(delay)
+    raise RuntimeError("FCM retry attempts exhausted")
+
+
+def fcm_token_is_invalid(response: httpx.Response) -> bool:
+    """Require token-specific evidence, not an auth, project, or payload error."""
+    if response.request.url.host != "fcm.googleapis.com":
+        return False
+    try:
+        details = response.json().get("error", {}).get("details", [])
+        if not isinstance(details, list):
+            return False
+        if response.status_code == 404:
+            return any(isinstance(detail, dict)
+                       and detail.get("@type") == "type.googleapis.com/google.firebase.fcm.v1.FcmError"
+                       and detail.get("errorCode") == "UNREGISTERED" for detail in details)
+        if response.status_code == 400:
+            violations = [violation for detail in details if isinstance(detail, dict)
+                          and detail.get("@type") == "type.googleapis.com/google.rpc.BadRequest"
+                          for violation in detail.get("fieldViolations", [])]
+            return bool(violations) and all(isinstance(v, dict) and v.get("field") == "message.token" for v in violations)
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return False
+
+
+async def fcm_access_token(client: httpx.AsyncClient, *, deadline: float | None = None) -> str:
     """Exchange a server-only service account assertion for a cached OAuth token."""
     global _fcm_access_token
     async with _fcm_token_lock:
@@ -524,6 +588,10 @@ async def fcm_access_token(client: httpx.AsyncClient) -> str:
         if _fcm_access_token and _fcm_access_token[0] == settings.fcm_service_account_path and _fcm_access_token[2] > now + 60:
             return _fcm_access_token[1]
         credentials = json.loads(Path(settings.fcm_service_account_path).read_text())
+        if (not isinstance(credentials, dict) or credentials.get("type") != "service_account"
+                or credentials.get("project_id") != settings.fcm_project_id
+                or credentials.get("token_uri") != "https://oauth2.googleapis.com/token"):
+            raise ValueError("FCM service account configuration is invalid")
         assertion = jwt.encode(
             {
                 "iss": credentials["client_email"],
@@ -535,12 +603,15 @@ async def fcm_access_token(client: httpx.AsyncClient) -> str:
             credentials["private_key"],
             algorithm="RS256",
         )
-        response = await client.post(
+        response = await fcm_post(
+            client,
             "https://oauth2.googleapis.com/token",
+            deadline=deadline if deadline is not None else time_module.monotonic() + FCM_DELIVERY_TIMEOUT_SECONDS,
             data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
         )
-        response.raise_for_status()
         result = response.json()
+        if not isinstance(result["access_token"], str) or not result["access_token"] or int(result["expires_in"]) <= 0:
+            raise ValueError("Invalid FCM OAuth response")
         _fcm_access_token = (settings.fcm_service_account_path, result["access_token"], now + int(result["expires_in"]))
         return result["access_token"]
 
@@ -551,23 +622,33 @@ async def send_push_to_device(device: asyncpg.Record, title: str, body: str, dat
     if device["provider"] == "fcm":
         if not settings.fcm_service_account_path:
             return
-        async with httpx.AsyncClient(timeout=8) as client:
-            access_token = await fcm_access_token(client)
-            response = await client.post(
-                f"https://fcm.googleapis.com/v1/projects/{settings.fcm_project_id}/messages:send",
-                headers={"Authorization": f"Bearer {access_token}"},
-                json={"message": {
-                    "token": device["token"],
-                    "notification": {"title": title, "body": body},
-                    "data": data,
-                    "android": {
-                        "priority": "high",
-                        "restricted_package_name": "com.schoolhop.app",
-                        "notification": {"channel_id": "schoolhop_activity", "visibility": "PRIVATE", "sound": "default"},
-                    },
-                }},
-            )
-            response.raise_for_status()
+        deadline = time_module.monotonic() + FCM_DELIVERY_TIMEOUT_SECONDS
+        async with asyncio.timeout_at(deadline), httpx.AsyncClient(timeout=10) as client:
+            access_token = await fcm_access_token(client, deadline=deadline)
+            try:
+                await fcm_post(
+                    client,
+                    f"https://fcm.googleapis.com/v1/projects/{settings.fcm_project_id}/messages:send",
+                    deadline=deadline,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={"message": {
+                        "token": device["token"],
+                        "notification": {"title": title, "body": body},
+                        "data": data,
+                        "android": {
+                            "priority": "high",
+                            "ttl": "60s",
+                            "restricted_package_name": "com.schoolhop.app",
+                            "notification": {"channel_id": "schoolhop_activity", "visibility": "PRIVATE", "sound": "default"},
+                        },
+                    }},
+                )
+            except httpx.HTTPStatusError as exc:
+                # Refresh on the next event, without retrying an authentication error.
+                global _fcm_access_token
+                if exc.response.status_code == 401 and _fcm_access_token and _fcm_access_token[1] == access_token:
+                    _fcm_access_token = None
+                raise
         return
 
     private_key = apns_private_key()
@@ -607,10 +688,14 @@ async def deliver_push(
     entity_id: UUID | str | None,
     action_url: str | None = None,
 ) -> None:
-    devices = await database.fetch(
-        "SELECT * FROM mobile_devices WHERE user_id = $1 AND enabled = true",
-        UUID(str(user_id)),
-    )
+    try:
+        devices = await database.fetch(
+            "SELECT * FROM mobile_devices WHERE user_id = $1 AND enabled = true",
+            UUID(str(user_id)),
+        )
+    except asyncpg.PostgresError:
+        logger.warning("Push device lookup failed")
+        return
     data = {
         "kind": kind,
         "entity_type": entity_type or "",
@@ -622,24 +707,20 @@ async def deliver_push(
             await send_push_to_device(device, title, body, data)
         except httpx.HTTPStatusError as exc:
             if device["provider"] == "fcm":
-                try:
-                    details = exc.response.json().get("error", {}).get("details", [])
-                    invalid_token = any(
-                        detail.get("@type") == "type.googleapis.com/google.firebase.fcm.v1.FcmError"
-                        and detail.get("errorCode") == "UNREGISTERED"
-                        for detail in details
-                    )
-                except (ValueError, AttributeError, TypeError):
-                    invalid_token = False
-                if exc.response.status_code == 401:
-                    global _fcm_access_token
-                    _fcm_access_token = None
+                invalid_token = fcm_token_is_invalid(exc.response)
             else:
                 invalid_token = exc.response.status_code in {400, 410}
             if invalid_token:
-                await database.execute("UPDATE mobile_devices SET enabled = false WHERE id = $1", device["id"])
+                try:
+                    # Do not disable a registration refreshed or reassigned while sending.
+                    await database.execute(
+                        "UPDATE mobile_devices SET enabled = false WHERE id = $1 AND user_id = $2 AND provider = $3 AND token = $4 AND last_seen_at = $5",
+                        device["id"], UUID(str(user_id)), device["provider"], device["token"], device["last_seen_at"],
+                    )
+                except asyncpg.PostgresError:
+                    logger.warning("Push invalid-token cleanup failed")
             logging.warning("Push provider %s returned HTTP %s", device["provider"], exc.response.status_code)
-        except (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, KeyError, TypeError):
+        except (httpx.HTTPError, jwt.PyJWTError, OSError, ValueError, KeyError, TypeError, TimeoutError):
             logging.warning("Push provider %s delivery failed", device["provider"])
 
 

@@ -1,5 +1,9 @@
 # Android FCM integration report
 
+For the current backend retry, cleanup, and opt-in runtime credential mount, see
+[Backend FCM HTTP v1](FCM_BACKEND.md). The original integration report below records
+the earlier client/backend work; its no-retry description predates that follow-up.
+
 Work is confined to the existing `feature/schoolhop-my-carpool-ui` branch. The reviewed integration is committed and pushed on this branch, then validated by manually dispatching Android Build with `require_firebase=true`. Production deployment/restarts, database or backend configuration changes, server-side Firebase credentials, Play uploads, signing-key changes, iOS workflow changes, and merging into main are outside this task.
 
 ## Existing implementation and gaps
@@ -27,6 +31,7 @@ The gaps addressed here were:
 | Driver accept/decline | `roster_response` | Selected trip, using new fallback |
 | Swap request | `trip_swap_request` | Trip; replacement driver's link includes `swap_request` |
 | Swap accept/decline | `trip_swap_decision` | Trip |
+| Trip started | `trip_start` | Trip |
 | Delay | `delay` | Trip |
 | Child pickup/dropoff/absence | `handover` | Trip |
 | Group invitation for a registered invitee | `invitation` | Group invitation acceptance |

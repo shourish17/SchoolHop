@@ -651,6 +651,42 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(row["user_id"], row["kind"]) for row in database.notifications], [(ids.parent_id, "handover")])
         self.assertNotIn(ids.unrelated_id, {row["user_id"] for row in database.notifications})
 
+    async def test_trip_events_dispatch_push_to_the_same_recipients_as_in_app_alerts(self):
+        for kind in ["trip_start", "delay", "handover", "trip_swap_request", "trip_swap_decision"]:
+            with self.subTest(kind=kind):
+                ids = ActionIds()
+                database = SwapDecisionDatabase(ids) if kind == "trip_swap_decision" else TripActionDatabase(ids)
+                original_fetch = database.fetch
+
+                async def fetch_with_devices(query, *args):
+                    if "mobile_devices" in query:
+                        self.assertIn("user_id = $1 AND enabled = true", query)
+                        return [{"provider": "fcm", "token": "test-only-device", "user_id": args[0]}]
+                    return await original_fetch(query, *args)
+
+                user = {"id": str(ids.driver_id), "name": "Driver"}
+                with patch.object(database, "fetch", side_effect=fetch_with_devices), patch.object(main, "send_push_to_device", new=AsyncMock()) as send:
+                    if kind == "trip_start":
+                        database.response_status = "accepted"
+                        await main.start_trip(ids.trip_id, user, database)
+                    elif kind == "delay":
+                        await main.delay_trip(ids.trip_id, main.TripNoteIn(minutes=10), user, database)
+                    elif kind == "handover":
+                        await main.handover(ids.trip_id, ids.child_id, main.HandoverIn(handover_type="picked_up"), user, database)
+                    elif kind == "trip_swap_request":
+                        await main.request_roster_change(ids.trip_id, main.ChangeRequestIn(request_type="swap", proposed_driver_user_id=ids.proposed_driver_id, note="Test-only swap"), user, database)
+                    else:
+                        await main.decide_roster_change(database.request_id, main.ChangeRequestDecisionIn(status="accepted"), {"id": str(ids.proposed_driver_id), "name": "Replacement driver"}, database)
+
+                expected = {(row["user_id"], row["kind"]) for row in database.notifications}
+                actual = {(call.args[0]["user_id"], call.args[3]["kind"]) for call in send.await_args_list}
+                self.assertTrue(expected)
+                self.assertEqual(actual, expected)
+                self.assertEqual(send.await_count, len(database.notifications))
+                self.assertNotIn(ids.unrelated_id, {recipient for recipient, _ in actual})
+                for call in send.await_args_list:
+                    self.assertIn(str(ids.trip_id), call.args[3]["action_url"])
+
     async def test_invitation_notification_includes_code_for_registered_invitee(self):
         ids = ActionIds()
         database = InvitationDatabase(ids)

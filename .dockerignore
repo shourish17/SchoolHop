@@ -1,0 +1,28 @@
+# Only the backend build inputs may enter the Docker build context.
+**
+!Dockerfile
+!requirements.txt
+!app/
+!app/**
+!migrations/
+!migrations/**
+
+# Exclude runtime secrets and Python caches even inside allowed source directories.
+**/.env
+**/.env.*
+**/secrets
+**/credentials
+**/*service-account*.json
+**/*service_account*.json
+**/*serviceAccount*.json
+**/*firebase-adminsdk*.json
+**/application_default_credentials.json
+**/google-services.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*.keystore
+**/__pycache__
+**/*.pyc
