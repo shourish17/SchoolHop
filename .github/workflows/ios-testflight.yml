@@ -3,6 +3,10 @@ name: iOS TestFlight Upload
 on:
   workflow_dispatch:
     inputs:
+      expected_commit:
+        description: Full approved SHA on release/ios-apns-handover-20261020. Must match the dispatched branch head.
+        required: true
+        type: string
       build_number:
         description: Optional CFBundleVersion override. Defaults to the GitHub run number.
         required: false
@@ -33,6 +37,13 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_commit }}
+
+      - name: Verify exact reviewed release source
+        env:
+          EXPECTED_RELEASE_COMMIT: ${{ inputs.expected_commit }}
+        run: python3 scripts/verify-ios-release.py --phase source --expected-commit "$EXPECTED_RELEASE_COMMIT" --report build/ios-source-verification.json
 
       - name: Show macOS and Xcode versions
         run: |
@@ -119,7 +130,6 @@ jobs:
             request["Authorization"] = "Bearer #{token}"
             response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(request) }
             unless response.code.to_i.between?(200, 299)
-              warn response.body
               raise "App Store Connect API Get #{path} failed with HTTP #{response.code}"
             end
             JSON.parse(response.body)
@@ -134,8 +144,26 @@ jobs:
           apps = api_request(token, "/v1/apps?filter[bundleId]=#{bundle_id}&limit=1").fetch("data")
           raise "App Store Connect app was not found for #{ENV.fetch("BUNDLE_ID")}" if apps.empty?
           app_id = apps.first.fetch("id")
-          builds = api_request(token, "/v1/builds?filter[app]=#{app_id}&sort=-version&limit=1").fetch("data")
-          puts(builds.empty? ? "0" : builds.first.fetch("attributes").fetch("version"))
+          # Compare all paginated build numbers numerically; string sorting can
+          # otherwise select build 9 ahead of build 10.
+          versions = []
+          path = "/v1/builds?filter[app]=#{app_id}&limit=200"
+          while path
+            page = api_request(token, path)
+            page.fetch("data").each do |build|
+              version = build.fetch("attributes").fetch("version")
+              raise "An existing build has a non-integer version; review numbering before building" unless version.match?(/\A[0-9]+\z/)
+              versions << Integer(version, 10)
+            end
+            next_link = page.fetch("links", {})["next"]
+            path = nil
+            if next_link
+              next_uri = URI(next_link)
+              raise "Unexpected App Store Connect pagination origin" unless next_uri.scheme == "https" && next_uri.host == "api.appstoreconnect.apple.com"
+              path = next_uri.request_uri
+            end
+          end
+          puts(versions.max || 0)
           RUBY
           )
 
@@ -206,6 +234,9 @@ jobs:
 
       - name: Sync Capacitor iOS project
         run: npx cap sync ios
+
+      - name: Verify bundled handover and APNs client code
+        run: python3 scripts/verify-ios-release.py --phase web --report build/ios-web-verification.json
 
       - name: Resolve CocoaPods dependencies
         run: |
@@ -582,6 +613,13 @@ jobs:
 
           echo "Signed SchoolHop app has CFBundleShortVersionString=$APP_MARKETING_VERSION, CFBundleVersion=$APP_BUILD_NUMBER, expected bundle ID, APNs entitlement, URL scheme, background location metadata, native plugin, and production API URL."
 
+      - name: Verify signed IPA source hashes and distribution identity
+        run: |
+          set -euo pipefail
+          IPA_PATH=$(find "$EXPORT_PATH" -maxdepth 1 -name "*.ipa" -print -quit)
+          test -n "$IPA_PATH"
+          python3 scripts/verify-ios-release.py --phase signed --ipa "$IPA_PATH" --build-number "$BUILD_NUMBER" --report build/ios-signed-verification.json
+
       - name: Upload IPA to App Store Connect
         if: ${{ inputs.upload_to_testflight }}
         env:
@@ -610,6 +648,7 @@ jobs:
           path: |
             build/xcode-logs
             build/ExportOptions.plist
+            build/ios-*-verification.json
           if-no-files-found: ignore
 
       - name: Upload signed IPA artifact
