@@ -1,5 +1,38 @@
 apply plugin: 'com.android.application'
 
+// Debug distribution has its own permanent identity; release signing stays separate.
+def debugKeystorePath = System.getenv("ANDROID_DEBUG_KEYSTORE_PATH")
+def debugStorePassword = System.getenv("ANDROID_DEBUG_KEYSTORE_PASSWORD")
+def debugKeyAlias = System.getenv("ANDROID_DEBUG_KEY_ALIAS")
+def debugKeyPassword = System.getenv("ANDROID_DEBUG_KEY_PASSWORD")
+def debugCertificateSha256 = System.getenv("ANDROID_DEBUG_CERT_SHA256")
+def debugCredentials = [debugKeystorePath, debugStorePassword, debugKeyAlias, debugKeyPassword]
+def requestedVersionCode = System.getenv("ANDROID_VERSION_CODE") ?: "9"
+if (!(requestedVersionCode ==~ /[1-9][0-9]*/) || requestedVersionCode.toBigInteger() < 9 || requestedVersionCode.toBigInteger() > 2100000000) {
+    throw new GradleException("Android versionCode must be an integer from 9 to 2100000000")
+}
+def persistentDebugConfigured = debugCredentials.every { it }
+if (debugCredentials.any { it } && !persistentDebugConfigured) {
+    throw new GradleException("All dedicated Android debug signing credentials are required")
+}
+if (persistentDebugConfigured) {
+    if (!(debugCertificateSha256 ==~ /[0-9a-f]{64}/)) {
+        throw new GradleException("A pinned Android debug certificate SHA-256 is required")
+    }
+    try {
+        def keystore = java.security.KeyStore.getInstance(file(debugKeystorePath), debugStorePassword.toCharArray())
+        def certificate = keystore.getCertificate(debugKeyAlias)
+        def signingKey = keystore.getKey(debugKeyAlias, debugKeyPassword.toCharArray())
+        def actual = certificate == null ? null : java.security.MessageDigest.getInstance("SHA-256")
+            .digest(certificate.encoded).encodeHex().toString()
+        if (!(signingKey instanceof java.security.PrivateKey) || actual != debugCertificateSha256) {
+            throw new IllegalStateException()
+        }
+    } catch (Exception ignored) {
+        throw new GradleException("Persistent Android debug signing identity could not be verified")
+    }
+}
+
 android {
     namespace "com.schoolhop.app"
     compileSdk rootProject.ext.compileSdkVersion
@@ -7,7 +40,7 @@ android {
         applicationId "com.schoolhop.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode Integer.parseInt(System.getenv("ANDROID_VERSION_CODE") ?: "1")
+        versionCode Integer.parseInt(requestedVersionCode)
         versionName System.getenv("ANDROID_VERSION_NAME") ?: "1.0.25"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
@@ -17,6 +50,15 @@ android {
         }
     }
     signingConfigs {
+        debug {
+            if (persistentDebugConfigured) {
+                storeFile file(debugKeystorePath)
+                storePassword debugStorePassword
+                keyAlias debugKeyAlias
+                keyPassword debugKeyPassword
+                storeType "PKCS12"
+            }
+        }
         release {
             def keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
             def keystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
@@ -31,6 +73,9 @@ android {
         }
     }
     buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
         release {
             minifyEnabled false
             if (signingConfigs.release.storeFile != null) {
@@ -44,6 +89,20 @@ android {
     }
     testOptions {
         unitTests.includeAndroidResources = true
+    }
+}
+
+// Never fall back to an automatically generated key for an installable debug APK.
+// Release-only builds do not need access to the debug private key.
+tasks.configureEach {
+    if (name == "validateSigningDebug") {
+        outputs.upToDateWhen { false }
+        outputs.cacheIf { false }
+        doFirst {
+            if (!persistentDebugConfigured) {
+                throw new GradleException("Persistent Android debug signing credentials are required; automatic debug signing is disabled")
+            }
+        }
     }
 }
 

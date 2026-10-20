@@ -41,9 +41,14 @@ npm run android:sync
 
 Build a debug APK:
 
+Distributable debug APKs require the permanent debug credentials and pinned
+certificate described in [Android signing and recovery](ANDROID_SIGNING.md).
+The example below assumes those environment variables are supplied securely;
+automatic debug signing is disabled. The default versionCode is 9.
+
 ```bash
 cd android
-./gradlew assembleDebug
+./gradlew --no-configuration-cache assembleDebug
 ```
 
 The APK is written to:
@@ -52,7 +57,9 @@ The APK is written to:
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Install on a connected emulator or device:
+Install updates only when the installed app has the same signing certificate.
+The existing Samsung build 7 uses a different certificate and must remain
+untouched; use a separate device with no SchoolHop installation for this APK.
 
 ```bash
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
@@ -178,6 +185,13 @@ See [Android FCM integration report](ANDROID_FCM.md) for the audit, configured b
 
 ## Signing
 
+Debug testing APKs use a dedicated persistent identity, independent of release
+signing. See [Android signing and recovery](ANDROID_SIGNING.md) for secure storage,
+the public fingerprint, the four `ANDROID_DEBUG_*` secrets, local builds and
+Samsung compatibility limits.
+
+### Future Google Play release signing
+
 Use Google Play App Signing with a dedicated Android upload key. Do not reuse Apple credentials and do not commit keystores.
 
 Create an upload keystore locally:
@@ -202,11 +216,8 @@ GitHub Actions secrets:
 - `ANDROID_KEY_ALIAS`
 - `ANDROID_KEY_PASSWORD`
 
-Encode the keystore:
-
-```bash
-base64 -w 0 schoolhop-upload-keystore.jks
-```
+Transfer any future release keystore encoding directly to secure secret storage;
+do not print it to a terminal or put it in Git.
 
 Local signed bundle example:
 
@@ -242,9 +253,15 @@ It is manual-only and:
 - builds Capacitor assets;
 - syncs Android;
 - validates manifest permissions;
-- builds a debug APK;
+- requires the permanent debug key and pinned certificate, builds a debug APK,
+  and verifies signing, versions, reviewed frontend, production URL and Firebase
+  before uploading the APK;
 - builds and uploads a signed release AAB only when Android signing secrets are configured;
 - reports commit SHA, application ID, version name, version code, artifact names, and signing status.
+
+It requires GPS commit `daa3c200` in the selected revision, versionCode at least 9,
+and removes temporary signing material even after failures. No Google Play upload
+is performed by this workflow.
 
 `Android Play Internal Testing Upload` is defined in `.github/workflows/android-play-upload.yml`.
 

@@ -13,7 +13,7 @@ on:
         required: false
         type: string
       version_code:
-        description: Optional Android versionCode override. Defaults to the GitHub run number.
+        description: Optional Android versionCode override (minimum 9). Defaults to the GitHub run number; increase for each distributed build.
         required: false
         type: string
 
@@ -38,9 +38,24 @@ jobs:
       ANDROID_VERSION_NAME: ${{ inputs.version_name || '1.0.25' }}
       ANDROID_VERSION_CODE: ${{ inputs.version_code || github.run_number }}
       ANDROID_REQUIRE_FIREBASE: ${{ inputs.require_firebase }}
+      ANDROID_DEBUG_CERT_SHA256: ${{ vars.ANDROID_DEBUG_CERT_SHA256 }}
+      SCHOOLHOP_CAPACITOR_API_BASE_URL: https://schoolhop.shourish.com
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify GPS revision and version inputs
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor daa3c200f9f31ecdad4ed03fc1ad2da2fefcf8b9 HEAD
+          python3 - <<'PY'
+          import os, re
+          value = os.environ["ANDROID_VERSION_CODE"]
+          if not re.fullmatch(r"[1-9][0-9]*", value) or not 9 <= int(value) <= 2100000000:
+              raise SystemExit("Android versionCode must be an integer from 9 to 2100000000")
+          PY
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -54,6 +69,9 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: gradle
+
+      - name: Test Android signing validation
+        run: python3 -m unittest discover -s tests -p test_android_debug_signing.py -v
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -129,9 +147,28 @@ jobs:
           echo "Version name: $ANDROID_VERSION_NAME"
           echo "Version code: $ANDROID_VERSION_CODE"
 
+      - name: Stage and verify persistent debug signing identity
+        env:
+          ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+          ANDROID_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEYSTORE_PASSWORD }}
+          ANDROID_DEBUG_KEY_ALIAS: ${{ secrets.ANDROID_DEBUG_KEY_ALIAS }}
+          ANDROID_DEBUG_KEY_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
+        run: python3 scripts/android_debug_signing.py stage
+
       - name: Build debug APK
         working-directory: android
-        run: ./gradlew --no-daemon assembleDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
+        env:
+          ANDROID_DEBUG_KEYSTORE_PATH: ${{ runner.temp }}/schoolhop-debug-signing/debug-signing.p12
+          ANDROID_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEYSTORE_PASSWORD }}
+          ANDROID_DEBUG_KEY_ALIAS: ${{ secrets.ANDROID_DEBUG_KEY_ALIAS }}
+          ANDROID_DEBUG_KEY_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --no-configuration-cache assembleDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
+
+      - name: Verify signed APK and packaged configuration
+        run: >-
+          python3 scripts/android_debug_signing.py verify-apk
+          android/app/build/outputs/apk/debug/app-debug.apk
+          --build-tools "$ANDROID_HOME/build-tools/35.0.0"
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -193,6 +230,11 @@ jobs:
         if: always()
         run: rm -f android/app/google-services.json
 
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          rm -rf -- "$RUNNER_TEMP/schoolhop-debug-signing" "$RUNNER_TEMP/android-signing"
+
       - name: Build summary
         run: |
           {
@@ -203,6 +245,8 @@ jobs:
             echo "- Version name: \`$ANDROID_VERSION_NAME\`"
             echo "- Version code: \`$ANDROID_VERSION_CODE\`"
             echo "- Debug APK artifact: \`schoolhop-android-debug-$GITHUB_SHA\`"
+            echo "- Debug signing verification: passed"
+            echo "- Debug certificate SHA-256: \`$ANDROID_DEBUG_CERT_SHA256\`"
             if [ "${{ steps.android-signing.outputs.configured }}" = "true" ]; then
               echo "- Release AAB artifact: \`schoolhop-android-release-aab-$GITHUB_SHA\`"
               echo "- Signing: configured"

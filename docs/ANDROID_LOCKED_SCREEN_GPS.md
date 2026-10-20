@@ -205,13 +205,14 @@ with a compatible version code, while no active trip is sharing GPS:
 adb install -r /path/to/reviewed/app-debug.apk
 ```
 
-**Existing CI signing limitation:** `android-build.yml` uses Android's automatically
-generated debug keystore on an ephemeral runner. The reviewed build-7 and build-8
-APKs have different signing certificates. Keeping `com.schoolhop.app` and increasing
-the version code alone therefore cannot guarantee an in-place update. Reuse the
-keystore that signed the installed APK; do not generate a replacement key or
-uninstall the app to work around this requirement. No signing configuration or
-key was changed by the GPS implementation.
+**Signing compatibility:** the historical build-7 and build-8 APKs used different
+automatically generated debug keys. Subsequent debug APKs use the dedicated
+persistent identity documented in [Android signing and recovery](ANDROID_SIGNING.md).
+The existing Samsung build-7 key was not recovered. The persistent-signing APK
+cannot update that installation in place; leave the Samsung app untouched and use
+a separate approved device without SchoolHop installed. Increasing versionCode
+does not bypass certificate checks. The GPS implementation itself did not change
+keys; persistent signing was introduced separately afterward.
 
 Use JDK 21 and SDK platform 36/build tools 35 as required by the existing project.
 If installation reports a signing mismatch or downgrade, stop; do not uninstall
