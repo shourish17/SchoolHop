@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     apns_bundle_id: str | None = None
     apns_private_key: str | None = None
     apns_private_key_path: str | None = None
-    apns_use_sandbox: bool = True
+    apns_use_sandbox: bool = False
     google_maps_browser_key: str | None = None
     google_routes_api_key: str | None = None
     public_site_url: str = "https://schoolhop.shourish.com"
@@ -687,7 +687,10 @@ async def send_push_to_device(
 
     private_key = apns_private_key()
     if not all([settings.apns_key_id, settings.apns_team_id, settings.apns_bundle_id, private_key]):
+        logger.warning("Push provider apns not configured; delivery skipped")
         return
+    if registration_guard is None:
+        raise ValueError("APNs delivery requires a registration guard")
     token = jwt.encode(
         {"iss": settings.apns_team_id, "iat": int(time_module.time())},
         private_key,
@@ -696,19 +699,22 @@ async def send_push_to_device(
     )
     host = "api.sandbox.push.apple.com" if settings.apns_use_sandbox else "api.push.apple.com"
     async with httpx.AsyncClient(http2=True, timeout=8) as client:
-        response = await client.post(
-            f"https://{host}/3/device/{device['token']}",
-            headers={
-                "authorization": f"bearer {token}",
-                "apns-topic": settings.apns_bundle_id,
-                "apns-push-type": "alert",
-                "apns-priority": "10",
-            },
-            json={
-                "aps": {"alert": {"title": title, "body": body}, "sound": "default"},
-                **data,
-            },
-        )
+        async with registration_guard() as current:
+            if not current:
+                raise PushRegistrationChanged()
+            response = await client.post(
+                f"https://{host}/3/device/{device['token']}",
+                headers={
+                    "authorization": f"bearer {token}",
+                    "apns-topic": settings.apns_bundle_id,
+                    "apns-push-type": "alert",
+                    "apns-priority": "10",
+                },
+                json={
+                    "aps": {"alert": {"title": title, "body": body}, "sound": "default"},
+                    **data,
+                },
+            )
         response.raise_for_status()
 
 
@@ -738,21 +744,29 @@ async def deliver_push(
     }
     for device in devices:
         try:
-            if device["provider"] == "fcm":
-                snapshot = (device["id"], UUID(str(user_id)), device["provider"], device["token"], device["last_seen_at"])
-                await send_push_to_device(
-                    device, title, body, data,
-                    registration_guard=lambda snapshot=snapshot: fcm_registration_guard(database, snapshot),
-                )
-            else:
-                await send_push_to_device(device, title, body, data)
+            snapshot = (device["id"], UUID(str(user_id)), device["provider"], device["token"], device["last_seen_at"])
+            await send_push_to_device(
+                device, title, body, data,
+                registration_guard=lambda snapshot=snapshot: fcm_registration_guard(database, snapshot),
+            )
         except PushRegistrationChanged:
             logger.info("Push registration changed; delivery cancelled")
         except httpx.HTTPStatusError as exc:
             if device["provider"] == "fcm":
                 invalid_token = fcm_token_is_invalid(exc.response)
             else:
-                invalid_token = exc.response.status_code in {400, 410}
+                # 400 also covers topic/environment/payload errors: preserve registrations.
+                try:
+                    reason = exc.response.json().get("reason")
+                except (ValueError, AttributeError):
+                    reason = None
+                known_reasons = {"Unregistered", "BadDeviceToken", "DeviceTokenNotForTopic", "BadTopic",
+                                 "InvalidProviderToken", "ExpiredProviderToken", "TopicDisallowed",
+                                 "BadEnvironmentKeyInToken", "Forbidden", "TooManyRequests", "InternalServerError"}
+                logger.warning("Push provider apns response status=%d reason=%s sandbox=%s",
+                               exc.response.status_code, reason if reason in known_reasons else "other",
+                               settings.apns_use_sandbox)
+                invalid_token = exc.response.status_code == 410 and reason == "Unregistered"
             if invalid_token:
                 try:
                     # Do not disable a registration refreshed or reassigned while sending.
@@ -1173,6 +1187,15 @@ async def enforce_trip_child_access(database: asyncpg.Pool, user_id: UUID | str,
         raise HTTPException(status_code=403, detail="Child trip permission required")
 
 
+def normalize_handover_status(child: dict[str, Any], trip_type: str) -> dict[str, Any]:
+    child = dict(child)
+    # Old clients stored every absence in pickup_status, even for drop-off trips.
+    # Respect the durable event without rewriting historical rows or adding API fields.
+    if child.pop("handover_absent", False):
+        child["pickup_status" if trip_type == "pickup" else "dropoff_status"] = "absent"
+    return child
+
+
 async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, trip: asyncpg.Record) -> list[dict[str, Any]]:
     is_driver = trip["driver_user_id"] == UUID(str(user_id))
     creator = await database.fetchval("SELECT created_by FROM carpool_groups WHERE id = $1", trip["group_id"])
@@ -1192,7 +1215,11 @@ async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, tri
     if can_view_all:
         rows = await database.fetch(
             """
-            SELECT tc.*, c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
+            SELECT tc.*, EXISTS (
+                       SELECT 1 FROM handovers h
+                       WHERE h.trip_id = tc.trip_id AND h.child_id = tc.child_id AND h.handover_type = 'absent'
+                   ) AS handover_absent,
+                   c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
                    c.parent_id, c.home_address, c.home_city, c.home_postcode, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
             FROM trip_children tc
             JOIN children c ON c.id = tc.child_id
@@ -1204,7 +1231,11 @@ async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, tri
     else:
         rows = await database.fetch(
             """
-            SELECT tc.*, c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
+            SELECT tc.*, EXISTS (
+                       SELECT 1 FROM handovers h
+                       WHERE h.trip_id = tc.trip_id AND h.child_id = tc.child_id AND h.handover_type = 'absent'
+                   ) AS handover_absent,
+                   c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
                    c.parent_id, c.home_address, c.home_city, c.home_postcode, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
             FROM trip_children tc
             JOIN children c ON c.id = tc.child_id
@@ -1214,7 +1245,7 @@ async def visible_trip_children(database: asyncpg.Pool, user_id: UUID | str, tri
             trip["id"],
             UUID(str(user_id)),
         )
-    children = rows_to_list(rows)
+    children = [normalize_handover_status(child, trip["trip_type"]) for child in rows_to_list(rows)]
     if not is_driver:
         for child in children:
             if child.get("parent_id") != str(user_id):
@@ -1554,7 +1585,11 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
         ),
         database.fetch(
             """
-            SELECT tc.*, c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
+            SELECT tc.*, EXISTS (
+                       SELECT 1 FROM handovers h
+                       WHERE h.trip_id = tc.trip_id AND h.child_id = tc.child_id AND h.handover_type = 'absent'
+                   ) AS handover_absent,
+                   c.name, c.year_group, c.pickup_notes, c.emergency_contact_name, c.emergency_contact_phone,
                    c.parent_id, c.home_address, c.home_city, c.home_postcode, c.home_country, c.home_latitude, c.home_longitude, c.home_place_id
             FROM trip_children tc
             JOIN children c ON c.id = tc.child_id
@@ -1604,6 +1639,7 @@ async def serialize_trips(database: asyncpg.Pool, user_id: UUID | str, trips: li
         can_view_all = is_driver or can_admin or trip["id"] in proposed_swap_trip_ids
         children: list[dict[str, Any]] = []
         for child in children_by_trip.get(trip["id"], []):
+            child = normalize_handover_status(child, trip["trip_type"])
             if not can_view_all and child.get("parent_id") != str(user_uuid):
                 continue
             child_payload = dict(child)
@@ -3572,42 +3608,58 @@ async def driver_unavailable(trip_id: UUID, payload: TripNoteIn, user: UserDep, 
 @app.post("/api/trips/{trip_id}/children/{child_id}/handover")
 async def handover(trip_id: UUID, child_id: UUID, payload: HandoverIn, user: UserDep, database: DbDep) -> dict[str, Any]:
     trip = await require_trip_driver(database, user["id"], trip_id)
-    linked = await database.fetchval("SELECT 1 FROM trip_children WHERE trip_id = $1 AND child_id = $2", trip_id, child_id)
-    if not linked:
-        raise HTTPException(status_code=404, detail="Child is not assigned to this trip")
-    status_column = "pickup_status" if payload.handover_type in {"picked_up", "absent"} else "dropoff_status"
-    value = "absent" if payload.handover_type == "absent" else payload.handover_type
     async with database.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(f"UPDATE trip_children SET {status_column} = $3 WHERE trip_id = $1 AND child_id = $2", trip_id, child_id, value)
-            row = await conn.fetchrow(
-                """
-                INSERT INTO handovers (trip_id, child_id, handover_type, completed_by, note)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (trip_id, child_id, handover_type)
-                DO UPDATE SET note = COALESCE(handovers.note, EXCLUDED.note)
-                RETURNING *
-                """,
-                trip_id,
-                child_id,
-                payload.handover_type,
-                UUID(user["id"]),
-                payload.note,
+            # Serialize retries and concurrent actions; validate the current assignment/type.
+            trip = await conn.fetchrow("SELECT * FROM trips WHERE id = $1 FOR UPDATE", trip_id)
+            if not trip or trip["driver_user_id"] != UUID(user["id"]):
+                raise HTTPException(status_code=403, detail="Assigned driver required")
+            expected = "picked_up" if trip["trip_type"] == "pickup" else "dropped_off"
+            if payload.handover_type not in {expected, "absent"}:
+                raise HTTPException(status_code=409, detail=f"This trip allows only {expected.replace('_', ' ')} handovers")
+            linked = await conn.fetchrow(
+                "SELECT * FROM trip_children WHERE trip_id = $1 AND child_id = $2 FOR UPDATE", trip_id, child_id,
             )
+            if not linked:
+                raise HTTPException(status_code=404, detail="Child is not assigned to this trip")
+            recorded = await conn.fetch(
+                "SELECT * FROM handovers WHERE trip_id = $1 AND child_id = $2 ORDER BY completed_at, id",
+                trip_id, child_id,
+            )
+            row = next((item for item in recorded if item["handover_type"] == payload.handover_type), None)
+            if row is None:
+                if recorded:
+                    raise HTTPException(status_code=409, detail="A handover has already been recorded for this child")
+                status_column = "pickup_status" if trip["trip_type"] == "pickup" else "dropoff_status"
+                if linked[status_column] != "pending":
+                    raise HTTPException(status_code=409, detail="A handover has already been recorded for this child")
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO handovers (trip_id, child_id, handover_type, completed_by, note)
+                    VALUES ($1, $2, $3, $4, $5)
+                    RETURNING *
+                    """,
+                    trip_id, child_id, payload.handover_type, UUID(user["id"]), payload.note,
+                )
+                await conn.execute(
+                    f"UPDATE trip_children SET {status_column} = $3 WHERE trip_id = $1 AND child_id = $2",
+                    trip_id, child_id, payload.handover_type,
+                )
+                await audit(conn, user["id"], "trip.handover", trip["group_id"], trip_id,
+                            {"child_id": str(child_id), "handover_type": payload.handover_type})
     parent = await database.fetchrow("SELECT parent_id, name FROM children WHERE id = $1", child_id)
     await notify(
         database,
         parent["parent_id"],
         "handover",
         f"{parent['name']} {payload.handover_type.replace('_', ' ')}",
-        payload.note or "A handover update was recorded.",
+        row["note"] or "A handover update was recorded.",
         "trip",
         trip_id,
         email=True,
         idempotency_key=f"handover:{trip_id}:{child_id}:{payload.handover_type}",
         action_url=f"/?tab=trip&trip={trip_id}",
     )
-    await audit(database, user["id"], "trip.handover", trip["group_id"], trip_id, {"child_id": str(child_id), "handover_type": payload.handover_type})
     return row_to_dict(row) or {}
 
 

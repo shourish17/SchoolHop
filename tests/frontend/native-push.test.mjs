@@ -22,7 +22,7 @@ test("Firebase staging accepts only the registered project and Android client", 
   assert.throws(() => validateFirebaseConfig("private-canary invalid JSON"), (error) => !error.message.includes("private-canary"));
 });
 
-function pushHarness({ configured = true, granted = true } = {}) {
+function pushHarness({ configured = true, granted = true, platform = "android" } = {}) {
   const listeners = new Map();
   const storage = new Map();
   const calls = [];
@@ -37,7 +37,7 @@ function pushHarness({ configured = true, granted = true } = {}) {
     async removeAllDeliveredNotifications() { calls.push(["clear-notifications"]); },
   };
   const context = vm.createContext({
-    state, isNativeApp: true, nativePlugins: () => ({ PushNotifications: plugin }), nativePlatform: () => "android",
+    state, isNativeApp: true, nativePlugins: () => ({ PushNotifications: plugin }), nativePlatform: () => platform,
     androidFirebaseMessagingConfigured: async () => configured,
     reportClientError: () => {},
     localStorage: { getItem: (key) => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
@@ -158,4 +158,56 @@ test("notification routes survive login and reject untrusted URLs", async () => 
   await context.openActionUrl("/?invite=invitation-id");
   assert.equal(state.pendingInviteToken, "invitation-id");
   assert.equal(state.pendingTab, "group");
+});
+
+
+test("iOS registers an APNs token without requiring Android Firebase or channels", async () => {
+  const h = pushHarness({ configured: false, platform: "ios" });
+  await h.context.registerNativePushToken(false);
+  await h.listeners.get("registration")({ value: "synthetic-ios-token" });
+  const [, device] = h.calls.find(([kind]) => kind === "POST");
+  assert.equal(device.provider, "apns");
+  assert.equal(device.platform, "ios");
+  assert.ok(!h.calls.some(([kind]) => kind === "channel"));
+  assert.ok(h.calls.some(([kind]) => kind === "native-register"));
+});
+
+test("iOS denied notification permission never registers a token", async () => {
+  const h = pushHarness({ platform: "ios", granted: false });
+  await h.context.registerNativePushToken();
+  assert.equal(h.listeners.size, 0);
+  assert.equal(h.calls.length, 0);
+});
+
+test("iOS foreground, background and notification taps use Capacitor events", async () => {
+  const events = new Map();
+  const calls = [];
+  const state = { token: "synthetic-user" };
+  const context = vm.createContext({
+    state, isNativeApp: true,
+    nativePlugins: () => ({
+      App: { addListener: (event, handler) => events.set(event, handler) },
+      PushNotifications: { addListener: (event, handler) => events.set(event, handler) },
+    }),
+    registerNativePushToken: async (request) => calls.push(request ? "prompt" : "check-permission"),
+    refreshGroupContext: async () => calls.push("refresh"),
+    openActionUrl: async (url) => calls.push(url), reportClientError() {},
+  });
+  vm.runInContext(source.slice(source.indexOf("function wireNativeEvents("), source.indexOf("async function registerNativePushToken(")), context);
+  context.wireNativeEvents();
+  events.get("appStateChange")({ isActive: false });
+  events.get("appStateChange")({ isActive: true });
+  events.get("pushNotificationReceived")({});
+  events.get("pushNotificationActionPerformed")({ notification: { data: { action_url: "/?tab=trip&trip=synthetic-trip" } } });
+  assert.deepEqual(calls, ["check-permission", "refresh", "/?tab=trip&trip=synthetic-trip"]);
+});
+
+test("iOS keeps Capacitor as the notification delegate and preserves production entitlement settings", async () => {
+  const delegate = await readFile(new URL("../../ios/App/App/AppDelegate.swift", import.meta.url), "utf8");
+  const project = await readFile(new URL("../../ios/App/App.xcodeproj/project.pbxproj", import.meta.url), "utf8");
+  assert.ok(!delegate.includes("UNUserNotificationCenter.current().delegate = self"));
+  assert.ok(delegate.includes(".capacitorDidRegisterForRemoteNotifications"));
+  assert.ok(delegate.includes(".capacitorDidFailToRegisterForRemoteNotifications"));
+  assert.match(project, /APS_ENVIRONMENT = production/);
+  assert.match(project, /APS_ENVIRONMENT = development/);
 });

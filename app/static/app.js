@@ -1026,18 +1026,23 @@ function renderTripConsole() {
   reconcileLocationPolling(trip);
   renderTripMap(trip);
   renderSwapRequestPanel(trip);
-  $("handoverButtons").innerHTML = trip.children.map((child) => `
-    <article class="handover-card">
-      <div>
-        <strong>${escapeHTML(child.name)}</strong>
-        <span>Pickup ${escapeHTML(child.pickup_status)} · Drop-off ${escapeHTML(child.dropoff_status)}</span>
-      </div>
+  $("handoverButtons").innerHTML = handoverButtonsHTML(trip, driver);
+}
+
+function handoverButtonsHTML(trip, driver) {
+  const type = trip.trip_type === "pickup" ? "picked_up" : "dropped_off";
+  const label = type === "picked_up" ? "Picked Up" : "Dropped Off";
+  return trip.children.map((child) => {
+    const status = trip.trip_type === "pickup" ? child.pickup_status : child.dropoff_status;
+    const disabled = !driver || status !== "pending" ? "disabled" : "";
+    return `<article class="handover-card">
+      <div><strong>${escapeHTML(child.name)}</strong>
+        <span>Pickup ${escapeHTML(child.pickup_status)} · Drop-off ${escapeHTML(child.dropoff_status)}</span></div>
       <div class="mini-actions">
-        <button data-child="${escapeHTML(child.child_id)}" data-type="picked_up" ${driver ? "" : "disabled"} type="button">Picked up</button>
-        <button data-child="${escapeHTML(child.child_id)}" data-type="dropped_off" ${driver ? "" : "disabled"} type="button">Dropped off</button>
-        <button class="ghost danger" data-child="${escapeHTML(child.child_id)}" data-type="absent" ${driver ? "" : "disabled"} type="button">Absent</button>
-      </div>
-    </article>`).join("");
+        <button data-child="${escapeHTML(child.child_id)}" data-type="${type}" ${disabled} type="button">${label}</button>
+        <button class="ghost danger" data-child="${escapeHTML(child.child_id)}" data-type="absent" ${disabled} type="button">Absent</button>
+      </div></article>`;
+  }).join("");
 }
 
 function renderSwapRequestPanel(trip) {

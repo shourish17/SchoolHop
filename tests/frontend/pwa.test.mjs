@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=29/);
-  assert.match(worker, /schoolhop-shell-v29/);
-  assert.match(worker, /\/static\/app\.js\?v=29/);
+  assert.match(html, /\/static\/app\.js\?v=31/);
+  assert.match(worker, /schoolhop-shell-v31/);
+  assert.match(worker, /\/static\/app\.js\?v=31/);
 });
 
 test("registration UI uses verified account creation flow", async () => {

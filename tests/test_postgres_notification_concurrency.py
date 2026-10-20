@@ -219,3 +219,192 @@ class PostgresNotificationConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             await self.request_swap()
         self.assertEqual(await self.database.fetchval("SELECT count(*) FROM roster_change_requests WHERE status='open'"), 1)
         self.assertEqual(send.await_count, 2)
+
+
+@unittest.skipUnless(SOCKET, "requires disposable PostgreSQL Unix socket")
+class PostgresHandoverConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    """Actual PostgreSQL row locks and unique notification index; no real pushes."""
+    response = PostgresNotificationConcurrencyTests.response
+    asyncTearDown = PostgresNotificationConcurrencyTests.asyncTearDown
+
+    async def asyncSetUp(self):
+        await PostgresNotificationConcurrencyTests.asyncSetUp(self)
+        await self.database.execute("""
+            ALTER TABLE trips ADD driver_user_id uuid, ADD group_id uuid, ADD trip_type text;
+            CREATE TABLE children (id uuid PRIMARY KEY, parent_id uuid, name text);
+            ALTER TABLE trip_children ADD pickup_status text DEFAULT 'pending', ADD dropoff_status text DEFAULT 'pending';
+            ALTER TABLE trip_children ADD PRIMARY KEY (trip_id, child_id);
+            CREATE TABLE handovers (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), trip_id uuid, child_id uuid,
+                handover_type text, completed_by uuid, note text, completed_at timestamptz DEFAULT now(),
+                UNIQUE(trip_id, child_id, handover_type));
+        """)
+        self.child_id, self.parent_id = uuid4(), uuid4()
+        await self.database.execute("UPDATE trips SET driver_user_id=$2, group_id=$3, trip_type='pickup' WHERE id=$1",
+                                    self.trip_id, self.owner, self.group_id)
+        await self.database.execute("INSERT INTO children VALUES ($1,$2,'Synthetic child')", self.child_id, self.parent_id)
+        await self.database.execute("INSERT INTO trip_children (trip_id,child_id) VALUES ($1,$2)", self.trip_id, self.child_id)
+        self.trip = await self.database.fetchrow("SELECT * FROM trips WHERE id=$1", self.trip_id)
+        self.push = AsyncMock()
+        for patcher in [patch.object(main, "require_trip_driver", new=AsyncMock(return_value=self.trip)),
+                        patch.object(main, "deliver_push", new=self.push)]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def handover(self, action="picked_up", note="Original"):
+        return await main.handover(self.trip_id, self.child_id, main.HandoverIn(handover_type=action, note=note),
+                                   {"id": str(self.owner)}, self.database)
+
+    async def test_concurrent_duplicates_create_one_handover_notification_and_push(self):
+        async with asyncio.timeout(5):
+            results = await asyncio.gather(*(self.handover(note=f"Synthetic note {i}") for i in range(8)))
+        self.assertEqual(len({row["id"] for row in results}), 1)
+        self.assertEqual(len({row["note"] for row in results}), 1)
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM handovers"), 1)
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM notifications"), 1)
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM audit_records"), 1)
+        self.push.assert_awaited_once()
+        self.assertEqual(await self.database.fetchval("SELECT pickup_status FROM trip_children"), "picked_up")
+
+    async def test_concurrent_absence_and_handover_cannot_overwrite_each_other(self):
+        async with asyncio.timeout(5):
+            results = await asyncio.gather(self.handover(), self.handover("absent"), return_exceptions=True)
+        self.assertEqual(sum(isinstance(row, HTTPException) and row.status_code == 409 for row in results), 1)
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM handovers"), 1)
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM notifications"), 1)
+        self.push.assert_awaited_once()
+
+    async def test_legacy_record_is_preserved_and_does_not_permit_wrong_trip_action(self):
+        legacy_id = uuid4()
+        await self.database.execute("INSERT INTO handovers (id,trip_id,child_id,handover_type,completed_by,note) VALUES ($1,$2,$3,'dropped_off',$4,'Historical')",
+                                    legacy_id, self.trip_id, self.child_id, self.owner)
+        with self.assertRaises(HTTPException) as error:
+            await self.handover("dropped_off")
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(await self.database.fetchval("SELECT note FROM handovers WHERE id=$1", legacy_id), "Historical")
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM notifications"), 0)
+
+    async def test_current_trip_type_and_driver_are_checked_under_lock(self):
+        await self.database.execute("UPDATE trips SET trip_type='dropoff' WHERE id=$1", self.trip_id)
+        with self.assertRaises(HTTPException):
+            await self.handover("picked_up")
+        await self.handover("dropped_off")
+        self.assertEqual(await self.database.fetchval("SELECT dropoff_status FROM trip_children"), "dropped_off")
+        await self.database.execute("UPDATE trips SET driver_user_id=$2 WHERE id=$1", self.trip_id, self.replacement)
+        with self.assertRaises(HTTPException) as error:
+            await self.handover("dropped_off")
+        self.assertEqual(error.exception.status_code, 403)
+
+
+    async def test_legacy_absence_remains_terminal_under_concurrent_old_client_requests(self):
+        await self.database.execute("UPDATE trips SET trip_type='dropoff' WHERE id=$1", self.trip_id)
+        await self.database.execute("UPDATE trip_children SET pickup_status='absent', dropoff_status='pending'")
+        await self.database.execute("INSERT INTO handovers (trip_id,child_id,handover_type,completed_by,note) VALUES ($1,$2,'absent',$3,'Legacy absence')", self.trip_id, self.child_id, self.owner)
+        async with asyncio.timeout(5):
+            results = await asyncio.gather(self.handover("absent"), self.handover("dropped_off"), return_exceptions=True)
+        self.assertIsInstance(results[1], HTTPException)
+        self.assertEqual(results[1].status_code, 409)
+        self.assertEqual(results[0]["note"], "Legacy absence")
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM handovers"), 1)
+        self.assertEqual(await self.database.fetchval("SELECT dropoff_status FROM trip_children"), "pending")
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM audit_records"), 0)
+
+    async def test_audit_failure_rolls_back_handover_and_status(self):
+        await self.database.execute("ALTER TABLE audit_records ADD CONSTRAINT reject_test_audit CHECK (action <> 'trip.handover')")
+        with self.assertRaises(asyncpg.CheckViolationError):
+            await self.handover()
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM handovers"), 0)
+        self.assertEqual(await self.database.fetchval("SELECT pickup_status FROM trip_children"), "pending")
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM notifications"), 0)
+        self.push.assert_not_awaited()
+        await self.database.execute("ALTER TABLE audit_records DROP CONSTRAINT reject_test_audit")
+        await self.handover()
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM audit_records"), 1)
+
+    async def test_notification_failure_leaves_atomic_audit_and_retry_does_not_duplicate(self):
+        with patch.object(main, "notify", new=AsyncMock(side_effect=RuntimeError("synthetic failure"))):
+            with self.assertRaises(RuntimeError):
+                await self.handover()
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM handovers"), 1)
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM audit_records"), 1)
+        await self.handover()
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM audit_records"), 1)
+        self.assertEqual(await self.database.fetchval("SELECT count(*) FROM notifications"), 1)
+
+    async def test_legacy_absence_read_query_preserves_stored_history(self):
+        await self.database.execute("UPDATE trips SET trip_type='dropoff' WHERE id=$1", self.trip_id)
+        await self.database.execute("UPDATE trip_children SET pickup_status='absent', dropoff_status='pending'")
+        await self.database.execute("INSERT INTO handovers (trip_id,child_id,handover_type,completed_by,note) VALUES ($1,$2,'absent',$3,'Historical')", self.trip_id, self.child_id, self.owner)
+        await self.database.execute("""
+            CREATE TABLE carpool_groups (id uuid PRIMARY KEY, created_by uuid);
+            ALTER TABLE children ADD year_group text, ADD pickup_notes text, ADD emergency_contact_name text,
+                ADD emergency_contact_phone text, ADD home_address text, ADD home_city text, ADD home_postcode text,
+                ADD home_country text, ADD home_latitude double precision, ADD home_longitude double precision,
+                ADD home_place_id text;
+        """)
+        await self.database.execute("INSERT INTO carpool_groups VALUES ($1,$2)", self.group_id, self.organiser)
+        trip = await self.database.fetchrow("SELECT * FROM trips WHERE id=$1", self.trip_id)
+        for user_id in [self.owner, self.parent_id]:
+            children = await main.visible_trip_children(self.database, user_id, trip)
+            self.assertEqual(children[0]["dropoff_status"], "absent")
+            self.assertNotIn("handover_absent", children[0])
+        self.assertEqual(await self.database.fetchval("SELECT dropoff_status FROM trip_children"), "pending")
+
+
+@unittest.skipUnless(SOCKET, "requires disposable PostgreSQL Unix socket")
+class PostgresApnsRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    asyncTearDown = PostgresNotificationConcurrencyTests.asyncTearDown
+    task = PostgresNotificationConcurrencyTests.task
+    wait_for_blocked_queries = PostgresNotificationConcurrencyTests.wait_for_blocked_queries
+
+    def response(self, status):
+        return httpx.Response(status, json={"reason": "Unregistered"} if status == 410 else {},
+                              request=httpx.Request("POST", "https://api.push.apple.com/3/device/synthetic"))
+
+    async def asyncSetUp(self):
+        await PostgresNotificationConcurrencyTests.asyncSetUp(self)
+        await self.database.execute("UPDATE mobile_devices SET provider='apns',platform='ios' WHERE id=$1", self.device_id)
+        for patcher in [patch.object(main.settings, "apns_key_id", "synthetic-key"),
+                        patch.object(main.settings, "apns_team_id", "synthetic-team"),
+                        patch.object(main.settings, "apns_bundle_id", "com.schoolhop.app"),
+                        patch.object(main, "apns_private_key", return_value="synthetic-key"),
+                        patch.object(main.jwt, "encode", return_value="synthetic-assertion")]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def deliver(self):
+        await main.deliver_push(self.database, self.owner, "handover", "Private child", "Private note", "trip", self.trip_id)
+
+    async def test_logout_and_reassignment_wait_for_inflight_apns_attempt(self):
+        for kind in ["logout", "reassignment"]:
+            with self.subTest(kind=kind):
+                await self.database.execute("UPDATE mobile_devices SET user_id=$2,enabled=true,last_seen_at=now() WHERE id=$1", self.device_id, self.owner)
+                entered, release = asyncio.Event(), asyncio.Event()
+                self.client.post.reset_mock()
+                async def post(*args, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    return self.response(200)
+                self.client.post.side_effect = post
+                delivery = self.task(self.deliver())
+                await asyncio.wait_for(entered.wait(), 5)
+                payload = main.MobileDeviceIn(provider="apns", platform="ios", token="synthetic-test-device")
+                writer = self.task(main.unregister_mobile_device(payload, {"id": str(self.owner)}, self.database) if kind == "logout"
+                                   else main.register_mobile_device(payload, {"id": str(self.replacement)}, self.database))
+                await self.wait_for_blocked_queries("UPDATE mobile_devices" if kind == "logout" else "INSERT INTO mobile_devices", 1)
+                self.assertFalse(writer.done())
+                release.set()
+                await asyncio.wait_for(asyncio.gather(delivery, writer), 5)
+                self.client.post.assert_awaited_once()
+
+    async def test_registration_mutation_winning_lock_cancels_apns_attempt(self):
+        for kind in ["logout", "reassignment", "refresh"]:
+            with self.subTest(kind=kind):
+                await self.database.execute("UPDATE mobile_devices SET user_id=$2,enabled=true,last_seen_at=now() WHERE id=$1", self.device_id, self.owner)
+                async with self.database.acquire() as writer:
+                    async with writer.transaction():
+                        await writer.execute("UPDATE mobile_devices SET user_id=$2,enabled=$3,last_seen_at=now() WHERE id=$1", self.device_id,
+                                             self.replacement if kind == "reassignment" else self.owner, kind != "logout")
+                        delivery = self.task(self.deliver())
+                        await self.wait_for_blocked_queries("SELECT id FROM mobile_devices", 1)
+                await asyncio.wait_for(delivery, 5)
+                self.client.post.assert_not_awaited()

@@ -1,0 +1,11 @@
+# Optional mount for an existing APNs key, applied only during an approved deployment.
+services:
+  api:
+    environment:
+      APNS_PRIVATE_KEY_PATH: /run/secrets/schoolhop_apns_private_key
+    secrets:
+      - schoolhop_apns_private_key
+
+secrets:
+  schoolhop_apns_private_key:
+    file: ${APNS_PRIVATE_KEY_FILE:?Set the existing external APNs private-key file path}

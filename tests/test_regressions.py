@@ -1559,6 +1559,8 @@ class TripActionDatabase:
         self.active_child_conflict = None
         self.safety_timed_out_conflicts = []
         self.handover_updates = 0
+        self.handovers = {}
+        self.child_status = {"pickup_status": "pending", "dropoff_status": "pending"}
         self.trip = Record(
             {
                 "id": ids.trip_id,
@@ -1671,8 +1673,10 @@ class TripActionDatabase:
             return Record({"id": self.trip["driver_user_id"], "name": "Driver", "email": "driver@example.com", "phone": None})
         if "FROM trip_responses" in query or "FROM trip_locations" in query:
             return None
+        if "SELECT * FROM trip_children" in query:
+            return Record(self.child_status)
         if "INSERT INTO handovers" in query:
-            return Record(
+            self.handovers[args[2]] = Record(
                 {
                     "id": uuid4(),
                     "trip_id": args[0],
@@ -1683,6 +1687,7 @@ class TripActionDatabase:
                     "completed_at": None,
                 }
             )
+            return self.handovers[args[2]]
         if "SELECT parent_id, name FROM children" in query:
             return Record({"parent_id": self.ids.parent_id, "name": "Child"})
         raise AssertionError(query)
@@ -1730,6 +1735,8 @@ class TripActionDatabase:
                 )
             self.safety_timed_out_conflicts = []
             return rows
+        if "SELECT * FROM handovers" in query:
+            return list(self.handovers.values())
         if "SELECT DISTINCT c.parent_id" in query:
             return [
                 Record({"parent_id": self.ids.parent_id, "child_name": "Child"}),
@@ -1771,6 +1778,7 @@ class TripActionDatabase:
             return None
         if "UPDATE trip_children SET" in query:
             self.handover_updates += 1
+            self.child_status["pickup_status" if "SET pickup_status" in query else "dropoff_status"] = args[2]
             return None
         raise AssertionError(query)
 

@@ -332,7 +332,7 @@ class FirebaseReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_apns_transport_auth_and_action_route_are_preserved(self):
         with patch.object(main.settings, "apns_key_id", "test-key-id"), patch.object(main.settings, "apns_team_id", "test-team"), patch.object(main.settings, "apns_bundle_id", "com.schoolhop.mobile"), patch.object(main.settings, "apns_use_sandbox", False), patch.object(main, "apns_private_key", return_value="fake-private-key"), patch.object(main.jwt, "encode", return_value="fake-apns-assertion") as encode:
-            await main.send_push_to_device({"provider": "apns", "token": "ios-device"}, "Private title", "Private body", {"action_url": "/?tab=alerts"})
+            await main.send_push_to_device({"provider": "apns", "token": "ios-device"}, "Private title", "Private body", {"action_url": "/?tab=alerts"}, registration_guard=lambda: nullcontext(True))
         args, kwargs = self.client.post.call_args
         self.assertEqual(args[0], "https://api.push.apple.com/3/device/ios-device")
         self.assertEqual(kwargs["headers"]["apns-topic"], "com.schoolhop.mobile")
@@ -344,7 +344,7 @@ class FirebaseReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_permanent_apns_error_still_cleans_up_that_registration(self):
         self.device["provider"] = "apns"
-        response = provider_response(410, host="api.push.apple.com")
+        response = httpx.Response(410, json={"reason": "Unregistered"}, request=httpx.Request("POST", "https://api.push.apple.com/send"))
         with patch.object(main, "send_push_to_device", new=AsyncMock(side_effect=httpx.HTTPStatusError("gone", request=response.request, response=response))):
             await self.notify()
         self.database.execute.assert_awaited_once()
