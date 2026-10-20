@@ -8,4 +8,5 @@
     <string name="location_channel_description">Shows when an assigned driver is sharing active trip location.</string>
     <string name="location_notification_title">SchoolHop trip tracking active</string>
     <string name="location_notification_body">Location is shared only for this active driver trip.</string>
+    <string name="location_stop_sharing">Stop sharing</string>
 </resources>

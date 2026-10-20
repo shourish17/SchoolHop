@@ -558,7 +558,13 @@ function wireEvents() {
       $("logout").disabled = false;
       return;
     }
-    stopTracking();
+    try {
+      await stopTrackingForLogout();
+    } catch {
+      toast("Could not stop GPS sharing. Keep SchoolHop open and try Sign Out again.");
+      $("logout").disabled = false;
+      return;
+    }
     localStorage.removeItem("schoolhop_token");
     sessionStorage.removeItem("schoolhop_selected_trip");
     sessionStorage.removeItem("schoolhop_selected_roster_driver");
@@ -1770,7 +1776,7 @@ async function startTracking(tripId) {
 }
 
 function stopTracking() {
-  if (state.watchId === "native") {
+  if (state.watchId === "native" || (isNativeApp && nativePlatform() === "android")) {
     stopNativeTracking().catch((error) => reportClientError(error, { source: "native-location-stop" }));
   } else if (state.watchId !== null) {
     navigator.geolocation.clearWatch(state.watchId);
@@ -1781,6 +1787,15 @@ function stopTracking() {
   state.locationPostTimer = null;
   state.queuedLocationPost = null;
   renderTripConsole();
+}
+
+async function stopTrackingForLogout() {
+  if (isNativeApp && nativePlatform() === "android") {
+    await stopNativeTracking();
+    clearLocalTrackingState();
+  } else {
+    stopTracking();
+  }
 }
 
 function reconcileLocationPolling(trip) {
@@ -1847,6 +1862,15 @@ async function fetchTripRoute(tripId, { force = false } = {}) {
 async function sendCurrentLocation(showToast) {
   const trip = selectedTrip();
   if (!trip) throw new Error("Select a trip first");
+  if (isNativeApp && nativePlatform() === "android") {
+    const { SchoolHopLocation } = nativePlugins();
+    if (!SchoolHopLocation) throw new Error("Native location service is unavailable");
+    const status = await SchoolHopLocation.status();
+    if (!status.tracking || status.tripId !== trip.id) throw new Error("Start GPS sharing for this trip first");
+    await SchoolHopLocation.requestLocationUpdate();
+    if (showToast) toast("GPS update requested");
+    return;
+  }
   if (!("geolocation" in navigator)) throw new Error("Geolocation is not supported in this browser");
   return new Promise((resolve, reject) => {
     navigator.geolocation.getCurrentPosition(async (position) => {

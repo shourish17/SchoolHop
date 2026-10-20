@@ -11,6 +11,7 @@
   },
   "android": {
     "allowMixedContent": false,
+    "loggingBehavior": "none",
     "adjustMarginsForEdgeToEdge": "disable"
   },
   "plugins": {

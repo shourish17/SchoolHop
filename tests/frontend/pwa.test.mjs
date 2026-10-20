@@ -301,10 +301,10 @@ test("Android native shell uses foreground service tracking and FCM registration
   assert.match(manifest, /android:foregroundServiceType="location"/);
   assert.match(manifest, /android:usesCleartextTraffic="false"/);
   assert.match(plugin, /SchoolHop Android tracking requires an HTTPS API base URL/);
-  assert.match(service, /startForeground\(NOTIFICATION_ID, buildNotification\(\)\)/);
-  assert.match(service, /setMinUpdateDistanceMeters\(25\)/);
-  assert.match(service, /POST_THROTTLE_MS = 4000L/);
-  assert.ok(service.includes('"/api/trips/" + tripId + "/locations"'));
+  assert.match(service, /ServiceCompat\.startForeground\(this, NOTIFICATION_ID, buildNotification\(\)/);
+  assert.match(service, /setMinUpdateDistanceMeters\(0\)/);
+  assert.match(service, /LOCATION_INTERVAL_MS = 10000/);
+  assert.ok(service.includes('"/api/trips/" + tripId + (upload ? "/locations" : "")'));
 });
 
 test("trip completion clears active GPS tracking in the PWA state", async () => {

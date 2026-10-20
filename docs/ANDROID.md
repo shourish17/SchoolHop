@@ -125,20 +125,25 @@ must also be checked on an emulator/device.
 
 Android tracking starts only after the existing frontend successfully starts an authorised assigned-driver trip through `POST /api/trips/{trip_id}/start`. The native plugin then starts a location foreground service and posts location updates to `POST /api/trips/{trip_id}/locations`.
 
+See [locked-screen GPS investigation, implementation and Galaxy test procedure](ANDROID_LOCKED_SCREEN_GPS.md)
+for the current local changes and verification limits. The native service validates
+the active driver trip before subscribing to GPS; its uploads do not depend on the WebView.
+
 Implemented Android behavior:
 
 - requests foreground location permission before tracking;
-- declares background location separately for locked-screen/background tracking review;
+- accepts fine or approximate foreground permission; background permission is optional for the existing foreground session and required for automatic background recovery on Android 11+;
 - uses a foreground service with `foregroundServiceType="location"`;
 - shows a persistent notification while tracking is active;
-- throttles uploads to roughly every four seconds and uses a 25 m distance filter;
+- requests fresh fixes every ten seconds without a distance gate, serializes uploads at least four seconds apart, and drops fixes older than thirty seconds;
 - persists active trip tracking state with encrypted Android storage for service recovery;
-- stops when the frontend calls `stopTripTracking`, when logout clears local state, or when the API rejects updates with 401, 403, 404, or 409;
+- revalidates the active driver trip every thirty seconds and pauses collection after a 120-second validation outage;
+- stops on explicit Stop sharing, trip completion, authorization rejection or the known JWT/trip deadline; Android logout awaits native shutdown;
 - does not start tracking for parents or children unless they are the authorised assigned driver who started the trip.
 
 Google Play declarations likely required:
 
-- Background location declaration, because active driver tracking can continue while the app is backgrounded or the screen is locked.
+- Review the existing background-location declaration separately from foreground location service access; locking a foreground-started location session alone does not require an Always permission grant.
 - Foreground service declaration for location.
 - Data Safety disclosure for precise location, account identifiers, child profile data, contact details, addresses, and app activity notifications.
 - Prominent in-app disclosure and privacy policy language explaining that live location is collected only during an active assigned-driver trip.
