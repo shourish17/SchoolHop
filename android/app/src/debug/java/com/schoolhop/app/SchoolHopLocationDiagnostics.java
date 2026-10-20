@@ -22,16 +22,21 @@ final class SchoolHopLocationDiagnostics {
     private static boolean collecting;
     private static long fixAge = -1;
     private static long uploadAge = -1;
+    private static int validationHttpStatus;
+    private static SchoolHopLocationService.ValidationFailure validationFailure = SchoolHopLocationService.ValidationFailure.NONE;
 
     static boolean isEnabled() { return true; }
 
     static synchronized void record(Context context, SchoolHopLocationTracker.Event event, int status,
-            boolean active, long fixAgeMs, long uploadAgeMs) {
+            boolean active, long fixAgeMs, long uploadAgeMs, int validationStatus,
+            SchoolHopLocationService.ValidationFailure failure) {
         lastEvent = event;
         lastStatus = status;
         collecting = active;
         fixAge = fixAgeMs;
         uploadAge = uploadAgeMs;
+        validationHttpStatus = validationStatus;
+        validationFailure = failure;
         Log.i("SchoolHopGpsDebug", snapshot(context).toString());
     }
 
@@ -40,7 +45,10 @@ final class SchoolHopLocationDiagnostics {
         JSObject result = new JSObject();
         result.put("debugOnly", true);
         result.put("event", lastEvent == null ? "NONE" : lastEvent.name());
-        result.put("httpStatus", lastStatus);
+        result.put("status", lastStatus);
+        result.put("httpStatus", validationFailure == SchoolHopLocationService.ValidationFailure.NONE ? lastStatus : validationHttpStatus);
+        result.put("validationHttpStatus", validationHttpStatus);
+        result.put("validationFailure", validationFailure.name());
         result.put("tracking", SchoolHopLocationService.running());
         result.put("collecting", collecting);
         result.put("fixAgeMsAtEvent", fixAge);

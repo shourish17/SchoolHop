@@ -44,7 +44,7 @@ Build a debug APK:
 Distributable debug APKs require the permanent debug credentials and pinned
 certificate described in [Android signing and recovery](ANDROID_SIGNING.md).
 The example below assumes those environment variables are supplied securely;
-automatic debug signing is disabled. The default versionCode is 9.
+automatic debug signing is disabled. The default versionCode is 10.
 
 ```bash
 cd android
@@ -58,8 +58,8 @@ android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Install updates only when the installed app has the same signing certificate.
-The existing Samsung build 7 uses a different certificate and must remain
-untouched; use a separate device with no SchoolHop installation for this APK.
+The Samsung now has persistent-signed build 9; build 10 can update it with the
+same certificate. Older build-7 installations use a different certificate.
 
 ```bash
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
@@ -135,6 +135,10 @@ Android tracking starts only after the existing frontend successfully starts an 
 See [locked-screen GPS investigation, implementation and Galaxy test procedure](ANDROID_LOCKED_SCREEN_GPS.md)
 for the current local changes and verification limits. The native service validates
 the active driver trip before subscribing to GPS; its uploads do not depend on the WebView.
+
+VersionCode 10 corrects Android deadline parsing for the production `+00:00`
+timestamp format and distinguishes local rejection from backend HTTP errors.
+See [GPS deadline validation and compatibility testing](ANDROID_GPS_VALIDATION.md).
 
 Implemented Android behavior:
 

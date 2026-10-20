@@ -218,10 +218,84 @@ public class SchoolHopLocationServiceTest {
         for (String secret : new String[] { "Bearer", "token", TRIP, USER, "api.example.test", "PRIVATE_ADDRESS", "latitude", "longitude" }) assertFalse(snapshot.contains(secret));
     }
 
+    @Test public void productionStyleOffsetDeadlineAllowsCollectionAndNativeUpload() throws Exception {
+        service.serverDeadline = "2099-10-20T05:29:20.625772+00:00";
+        start();
+        assertTrue(service.collecting);
+        fix();
+        assertEquals(1, service.requests.stream().filter(c -> c.getRequestMethod().equals("POST")).count());
+        if (SchoolHopLocationDiagnostics.isEnabled()) {
+            assertEquals("NONE", SchoolHopLocationDiagnostics.snapshot(service).getString("validationFailure"));
+        }
+    }
+
+    @Test public void malformedDeadlineIsLocalRejectionAfterHttp200AndNeverCollects() throws Exception {
+        service.serverDeadline = "PRIVATE_INVALID_TIMESTAMP";
+        start();
+        assertFalse(service.collecting);
+        assertFalse(SchoolHopLocationService.running());
+        if (SchoolHopLocationDiagnostics.isEnabled()) {
+            JSONObject snapshot = SchoolHopLocationDiagnostics.snapshot(service);
+            assertEquals(200, snapshot.getInt("httpStatus"));
+            assertEquals(200, snapshot.getInt("validationHttpStatus"));
+            assertEquals(409, snapshot.getInt("status"));
+            assertEquals("INVALID_SAFETY_DEADLINE", snapshot.getString("validationFailure"));
+            assertFalse(snapshot.toString().contains("PRIVATE_INVALID_TIMESTAMP"));
+        }
+    }
+
+    @Test public void actualBackendConflictRemainsHttp409WithoutLocalParsingFailure() throws Exception {
+        service.validationStatus = 409;
+        service.serverDeadline = "PRIVATE_BODY_MUST_NOT_BE_PARSED";
+        start();
+        assertFalse(service.collecting);
+        if (SchoolHopLocationDiagnostics.isEnabled()) {
+            JSONObject snapshot = SchoolHopLocationDiagnostics.snapshot(service);
+            assertEquals(409, snapshot.getInt("httpStatus"));
+            assertEquals(409, snapshot.getInt("validationHttpStatus"));
+            assertEquals("NONE", snapshot.getString("validationFailure"));
+        }
+    }
+
+    @Test public void expiredSafetyDeadlineRemainsTerminalDespiteValidOffsetFormat() throws Exception {
+        service.serverDeadline = Instant.ofEpochMilli(System.currentTimeMillis() - 60000).toString().replace("Z", "+00:00");
+        start();
+        assertFalse(service.collecting);
+        if (SchoolHopLocationDiagnostics.isEnabled()) {
+            assertEquals("DEADLINE_EXPIRED", SchoolHopLocationDiagnostics.snapshot(service).getString("validationFailure"));
+        }
+    }
+
+    @Test public void delayedTripStillCannotCollectWithAValidOffsetDeadline() throws Exception {
+        service.serverState = "delayed";
+        service.serverDeadline = "2099-10-20T05:29:20.625772+00:00";
+        start();
+        assertFalse(service.collecting);
+    }
+
+    @Test public void endedTripStillCannotCollectWithAValidOffsetDeadline() throws Exception {
+        service.serverEndedAt = "2026-10-20T02:29:20.625772+00:00";
+        start();
+        assertFalse(service.collecting);
+    }
+
+    @Test public void malformedResponseHasSanitizedLocalFailureMetadata() throws Exception {
+        service.responseOverride = "{PRIVATE_INVALID_RESPONSE";
+        start();
+        assertFalse(service.collecting);
+        if (SchoolHopLocationDiagnostics.isEnabled()) {
+            JSONObject snapshot = SchoolHopLocationDiagnostics.snapshot(service);
+            assertEquals(200, snapshot.getInt("httpStatus"));
+            assertEquals("MALFORMED_RESPONSE", snapshot.getString("validationFailure"));
+            assertFalse(snapshot.toString().contains("PRIVATE_INVALID_RESPONSE"));
+        }
+    }
+
     public static class TestService extends SchoolHopLocationService {
         boolean collecting, defer;
-        int collectionStarts, uploadStatus = 200;
+        int collectionStarts, uploadStatus = 200, validationStatus = 200;
         String serverState = "started", serverDriver = USER;
+        String serverDeadline, serverEndedAt, responseOverride;
         final List<FakeConnection> requests = new ArrayList<>();
         final List<Runnable> jobs = new ArrayList<>();
         @Override protected FusedLocationProviderClient createLocationClient() { return null; }
@@ -233,9 +307,11 @@ public class SchoolHopLocationServiceTest {
         @Override protected void executeNetwork(Runnable job) { if (defer) jobs.add(job); else job.run(); }
         @Override protected HttpURLConnection openConnection(String url) throws Exception {
             String body = new JSONObject().put("status", serverState).put("driver_user_id", serverDriver)
-                .put("ended_at", JSONObject.NULL).put("safety_timeout_at", Instant.ofEpochMilli(System.currentTimeMillis() + 3600000).toString())
+                .put("ended_at", serverEndedAt == null ? JSONObject.NULL : serverEndedAt)
+                .put("safety_timeout_at", serverDeadline == null ? Instant.ofEpochMilli(System.currentTimeMillis() + 3600000).toString() : serverDeadline)
                 .put("private_address", "PRIVATE_ADDRESS").toString();
-            FakeConnection connection = new FakeConnection(new URL(url), url.endsWith("/locations") ? uploadStatus : 200, body);
+            FakeConnection connection = new FakeConnection(new URL(url), url.endsWith("/locations") ? uploadStatus : validationStatus,
+                responseOverride == null ? body : responseOverride);
             requests.add(connection); return connection;
         }
     }

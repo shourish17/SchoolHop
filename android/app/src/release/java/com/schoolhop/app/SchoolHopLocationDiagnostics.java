@@ -7,6 +7,7 @@ import com.getcapacitor.JSObject;
 final class SchoolHopLocationDiagnostics {
     static boolean isEnabled() { return false; }
     static void record(Context context, SchoolHopLocationTracker.Event event, int status,
-            boolean active, long fixAgeMs, long uploadAgeMs) { }
+            boolean active, long fixAgeMs, long uploadAgeMs, int validationStatus,
+            SchoolHopLocationService.ValidationFailure failure) { }
     static JSObject snapshot(Context context) { return new JSObject(); }
 }

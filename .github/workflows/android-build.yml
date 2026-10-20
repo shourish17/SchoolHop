@@ -164,6 +164,9 @@ jobs:
           ANDROID_DEBUG_KEY_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
         run: ./gradlew --no-daemon --no-configuration-cache assembleDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
 
+      - name: Test deadline compatibility with Build 9 desugaring
+        run: python3 scripts/test_android_deadline_desugaring.py
+
       - name: Verify signed APK and packaged configuration
         run: >-
           python3 scripts/android_debug_signing.py verify-apk

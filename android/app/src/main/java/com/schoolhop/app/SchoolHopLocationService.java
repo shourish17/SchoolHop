@@ -40,6 +40,7 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.DateTimeException;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -68,6 +69,9 @@ public class SchoolHopLocationService extends Service {
     private SchoolHopLocationTracker tracker;
     private long lastFixAt = -1;
     private long lastSuccessAt = -1;
+    enum ValidationFailure { NONE, MALFORMED_RESPONSE, INVALID_SAFETY_DEADLINE, TRIP_NOT_ACTIVE, DRIVER_MISMATCH, DEADLINE_EXPIRED }
+    private int validationHttpStatus;
+    private ValidationFailure validationFailure = ValidationFailure.NONE;
 
     static final class Session {
         final String tripId;
@@ -127,7 +131,7 @@ public class SchoolHopLocationService extends Service {
                 if (event == SchoolHopLocationTracker.Event.UPLOADED) lastSuccessAt = now();
                 SchoolHopLocationDiagnostics.record(SchoolHopLocationService.this, event, status,
                     tracker.isCollecting(), lastFixAt < 0 ? -1 : now() - lastFixAt,
-                    lastSuccessAt < 0 ? -1 : now() - lastSuccessAt);
+                    lastSuccessAt < 0 ? -1 : now() - lastSuccessAt, validationHttpStatus, validationFailure);
             }
         });
         registerNetworkCallback();
@@ -162,6 +166,8 @@ public class SchoolHopLocationService extends Service {
                 disconnect();
                 session = next;
                 lastFixAt = lastSuccessAt = -1;
+                validationHttpStatus = 0;
+                validationFailure = ValidationFailure.NONE;
                 if (!prefs.edit().putBoolean("tracking", true).putString("tripId", next.tripId)
                         .putString("token", next.token).putString("apiBaseUrl", next.baseUrl).commit()) {
                     throw new IllegalStateException();
@@ -242,16 +248,30 @@ public class SchoolHopLocationService extends Service {
         Session requested = session;
         runRequest(requested, false, null, (status, body) -> {
             long deadline = 0;
+            validationHttpStatus = status;
+            validationFailure = ValidationFailure.NONE;
             if (status == 200) {
                 try {
                     JSONObject trip = new JSONObject(body);
-                    long safetyUntil = Instant.parse(trip.getString("safety_timeout_at")).toEpochMilli();
-                    if (!"started".equals(trip.getString("status")) || !trip.isNull("ended_at")
-                            || !requested.userId.equals(trip.getString("driver_user_id"))) status = 409;
+                    long safetyUntil = SchoolHopSafetyDeadline.parseMillis(trip.getString("safety_timeout_at"));
+                    if (!"started".equals(trip.getString("status")) || !trip.isNull("ended_at")) {
+                        validationFailure = ValidationFailure.TRIP_NOT_ACTIVE;
+                    } else if (!requested.userId.equals(trip.getString("driver_user_id"))) {
+                        validationFailure = ValidationFailure.DRIVER_MISMATCH;
+                    }
                     long remaining = Math.min(safetyUntil, requested.tokenExpiry) - System.currentTimeMillis();
-                    if (remaining <= 0) status = 409;
+                    if (remaining <= 0 && validationFailure == ValidationFailure.NONE) {
+                        validationFailure = ValidationFailure.DEADLINE_EXPIRED;
+                    }
+                    if (validationFailure != ValidationFailure.NONE) status = 409;
                     deadline = SystemClock.elapsedRealtime() + Math.max(0, remaining);
-                } catch (Exception ignored) { status = 409; }
+                } catch (DateTimeException | ArithmeticException ignored) {
+                    validationFailure = ValidationFailure.INVALID_SAFETY_DEADLINE;
+                    status = 409;
+                } catch (Exception ignored) {
+                    validationFailure = ValidationFailure.MALFORMED_RESPONSE;
+                    status = 409;
+                }
             }
             callback.complete(status, deadline);
         });

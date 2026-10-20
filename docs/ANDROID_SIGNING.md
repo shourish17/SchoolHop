@@ -106,7 +106,7 @@ env = dict(os.environ,
     ANDROID_DEBUG_KEY_ALIAS=credentials['alias'],
     ANDROID_DEBUG_KEY_PASSWORD=credentials['key_password'],
     ANDROID_DEBUG_CERT_SHA256=metadata['certificate_sha256'],
-    ANDROID_VERSION_CODE='9', ANDROID_VERSION_NAME='1.0.25', ANDROID_REQUIRE_FIREBASE='true')
+    ANDROID_VERSION_CODE='10', ANDROID_VERSION_NAME='1.0.25', ANDROID_REQUIRE_FIREBASE='true')
 subprocess.run(['./gradlew', '--no-daemon', '--no-configuration-cache',
                 'assembleDebug', ':app:testDebugUnitTest', ':app:assembleDebugAndroidTest'],
                cwd='android', env=env, check=True)
@@ -118,7 +118,7 @@ PY
 ```
 
 The APK is `android/app/build/outputs/apk/debug/app-debug.apk`. Before distributing
-a later build, replace versionCode 9 with the next unused higher value. Never use
+a later build, replace versionCode 10 with the next unused higher value. Never use
 Gradle `--debug`, dump the environment, or enable shell tracing around credentials.
 
 ## Recovery
@@ -206,15 +206,18 @@ a new key, but must be coordinated across primary storage, backup and CI.
 
 ## Samsung and other Android devices
 
-The Samsung currently installed build 7 has certificate
+The original Samsung build 7 had certificate
 `fa2005e9c724f0302c323c56b6844f9072b3474c396e102aab966bd71d89fa54`.
-Its private key was not recovered. The new persistent certificate differs, so
-**do not attempt an in-place update on that installation or uninstall it**.
+Its private key was not recovered. **Do not update or uninstall any remaining
+build-7 installation as part of this process.** The user has since installed
+persistent-signed build 9 on the Samsung. Build 10 uses that same persistent
+certificate and can update build 9 in place, while no active trip is sharing GPS.
 A normal install in another Android user/profile may still conflict because
 package signing identity is shared across users. Use a separate approved device
 or emulator with no existing `com.schoolhop.app` package, or an already compatible
-installation signed by the new persistent key. A Samsung migration requires a
-separate decision; versionCode 9 does not bypass the certificate check.
+installation signed by the persistent key. Any migration from an older signing
+identity requires a separate decision; versionCode alone does not bypass the
+certificate check.
 
 Verify the downloaded APK with `apksigner verify --print-certs`, compare its
 certificate to the public fingerprint above, and confirm versionCode/versionName
