@@ -33,7 +33,10 @@ const state = {
   trackingTripId: null,
   locationPollId: null,
   locationPollTripId: null,
-  locationPollInFlight: false,
+  locationPollInFlight: null,
+  viewerActive: true,
+  viewerRefreshPromise: null,
+  lastViewerResumeAt: 0,
   routePollInFlight: false,
   lastLocationPostAt: 0,
   queuedLocationPost: null,
@@ -249,8 +252,12 @@ function canDeleteRoster(trip) {
   return trip.created_by === state.me.id || groupCreatorId === state.me.id;
 }
 
+function tripIsActive(trip) {
+  return Boolean(trip && !trip.ended_at && (trip.status === "started" || (trip.status === "delayed" && trip.started_at)));
+}
+
 function canEndTrip(trip) {
-  return Boolean(trip && trip.status === "started" && (isDriver(trip) || trip.can_admin_end_trip));
+  return Boolean(tripIsActive(trip) && (isDriver(trip) || trip.can_admin_end_trip));
 }
 
 function tripStatusLabel(trip) {
@@ -264,7 +271,15 @@ function mapLocation(trip) {
   const latitude = Number(location.latitude);
   const longitude = Number(location.longitude);
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
-  return { ...location, latitude, longitude };
+  const observed = Number(location.observed_at_ms || 0);
+  const timestamp = Date.parse(location.recorded_at || location.received_at || "");
+  const age = observed && Number.isFinite(location.age_seconds)
+    ? location.age_seconds + Math.max(0, (Date.now() - observed) / 1000)
+    : (Date.now() - timestamp) / 1000;
+  const fresh = location.fresh !== false && Number.isFinite(age) && age >= -30
+    && age <= Number(location.stale_after_seconds || 60);
+  return { ...location, latitude, longitude, fresh,
+    message: fresh ? location.message : "GPS stale: showing the last known position. Waiting for updated driver location..." };
 }
 
 function formatClock(value) {
@@ -299,7 +314,7 @@ function routeStatusMessage(reason, fallback) {
 function lastLocationLabel(trip) {
   const location = trip && trip.latest_location;
   if (!location || !location.received_at) return "";
-  return `Last location update: ${formatClock(location.received_at)}`;
+  return `Last location update: ${formatClock(location.recorded_at || location.received_at)}`;
 }
 
 function etaTitle(route) {
@@ -312,11 +327,11 @@ function etaTitle(route) {
 }
 
 function etaSummaryHTML(trip) {
-  if (!trip || trip.status !== "started") return "";
+  if (!trip || !tripIsActive(trip)) return "";
   const location = mapLocation(trip);
   const route = trip.latest_route;
   const lastLocation = lastLocationLabel(trip);
-  if (route && route.eta_at && route.duration_seconds != null) {
+  if (location && location.fresh && route && route.eta_at && route.duration_seconds != null) {
     const duration = formatDuration(route.duration_seconds);
     const distance = formatDistance(route.distance_meters);
     return `
@@ -327,7 +342,8 @@ function etaSummaryHTML(trip) {
         ${lastLocation ? `<small>${escapeHTML(lastLocation)}</small>` : ""}
       </div>`;
   }
-  const message = routeStatusMessage(trip.route_reason, !location ? "Waiting for driver's location..." : trip.route_message);
+  const message = !location ? "Waiting for driver's location..." : !location.fresh
+    ? "GPS stale. Waiting for updated driver location..." : routeStatusMessage(trip.route_reason, trip.route_message);
   return `
     <div class="eta-summary muted">
       <strong>${escapeHTML(message)}</strong>
@@ -383,6 +399,7 @@ function hydrateUrlActions() {
 }
 
 function wireEvents() {
+  wireViewerEvents();
   $("showLogin").addEventListener("click", () => toggleAuth("login"));
   $("showRegister").addEventListener("click", () => toggleAuth("registerStart"));
   $("showForgotPassword").addEventListener("click", () => toggleAuth("forgotPassword"));
@@ -776,7 +793,13 @@ async function refreshGroupContext() {
   if (requestId !== state.refreshGroupRequestId) return;
   state.group = group;
   state.groupChildren = groupChildrenResult;
-  state.trips = trips;
+  state.trips = trips.map((trip) => {
+    const previous = state.trips.find((item) => item.id === trip.id);
+    return { ...trip, latest_route: previous && previous.latest_route,
+      route_message: previous && previous.route_message, route_reason: previous && previous.route_reason,
+      next_route_refresh_at: previous && previous.next_route_refresh_at,
+      latest_location: trip.latest_location ? { ...trip.latest_location, observed_at_ms: Date.now() } : null };
+  });
   stopTrackingIfNoLongerAllowed();
   const notifications = settledValue(notificationsResult, state.notifications, "notifications-refresh");
   const pendingActions = settledValue(pendingActionsResult, state.pendingActions, "pending-actions-refresh");
@@ -806,7 +829,7 @@ function chooseSelectedTrip() {
 function stopTrackingIfNoLongerAllowed() {
   if (!state.trackingTripId) return;
   const trackedTrip = state.trips.find((trip) => trip.id === state.trackingTripId);
-  if (trackedTrip && trackedTrip.status === "started" && isDriver(trackedTrip)) return;
+  if (tripIsActive(trackedTrip) && isDriver(trackedTrip)) return;
   stopTracking();
 }
 
@@ -859,9 +882,9 @@ function renderAll() {
 
 function renderHome() {
   const trips = activeTrips();
-  const startedTrips = trips.filter((trip) => trip.status === "started");
+  const startedTrips = trips.filter((trip) => tripIsActive(trip));
   const currentTrip = startedTrips[0] || null;
-  const upcomingTrips = trips.filter((trip) => trip.status !== "started");
+  const upcomingTrips = trips.filter((trip) => !tripIsActive(trip));
   const nextTrip = upcomingTrips[0] || null;
   const remainingTrips = upcomingTrips.slice(1);
   const trackedTrips = startedTrips.filter((trip) => mapLocation(trip));
@@ -953,7 +976,7 @@ function tripCard(trip, selectable = true) {
   const response = trip.my_response ? pill(trip.my_response.status, statusTone(trip.my_response.status)) : "";
   const selected = selectedTrip();
   const active = selectable && selected && selected.id === trip.id ? " selected" : "";
-  const tracking = trip.status === "started" && mapLocation(trip);
+  const tracking = tripIsActive(trip) && mapLocation(trip);
   return `
     <article class="item-card trip-card${active}" data-trip="${escapeHTML(trip.id)}" data-tracking="${tracking ? "on" : "off"}">
       <div class="item-head">
@@ -976,7 +999,7 @@ function tripCard(trip, selectable = true) {
 function renderTripConsole() {
   const trip = selectedTrip();
   const location = mapLocation(trip);
-  const trackingActive = state.watchId !== null || (trip && trip.status === "started" && location);
+  const trackingActive = state.watchId !== null || (tripIsActive(trip) && location);
   $("trackingBanner").className = `tracking ${trackingActive ? "on" : "off"}`;
   $("trackingBanner").textContent = trackingMessage(trip, location);
   if (!trip) {
@@ -1015,29 +1038,34 @@ function renderTripConsole() {
   $("swapTrip").disabled = !actionable;
   $("delayTrip").classList.toggle("hidden", !actionable);
   $("swapTrip").classList.toggle("hidden", !actionable);
-  $("startTrip").textContent = trip.status === "started" ? "Start GPS" : "Start trip";
+  $("startTrip").textContent = tripIsActive(trip) ? "Start GPS" : "Start trip";
   $("startTrip").disabled = !driver || !accepted || !["planned", "delayed", "started"].includes(trip.status) || !canStartToday;
   $("startTrip").title = !accepted
     ? "Accept this trip before starting it"
     : (!canStartToday ? "Trips can only be started on their service date" : "");
   $("endTrip").disabled = !canEndTrip(trip);
   $("endTrip").classList.toggle("hidden", !canEndTrip(trip));
-  $("sendLocation").disabled = !driver || trip.status !== "started";
+  $("sendLocation").disabled = !driver || !tripIsActive(trip);
   reconcileLocationPolling(trip);
   renderTripMap(trip);
   renderSwapRequestPanel(trip);
-  $("handoverButtons").innerHTML = trip.children.map((child) => `
-    <article class="handover-card">
-      <div>
-        <strong>${escapeHTML(child.name)}</strong>
-        <span>Pickup ${escapeHTML(child.pickup_status)} · Drop-off ${escapeHTML(child.dropoff_status)}</span>
-      </div>
+  $("handoverButtons").innerHTML = handoverButtonsHTML(trip, driver);
+}
+
+function handoverButtonsHTML(trip, driver) {
+  const type = trip.trip_type === "pickup" ? "picked_up" : "dropped_off";
+  const label = type === "picked_up" ? "Picked up" : "Dropped off";
+  return trip.children.map((child) => {
+    const status = trip.trip_type === "pickup" ? child.pickup_status : child.dropoff_status;
+    const disabled = !driver || status !== "pending" ? "disabled" : "";
+    return `<article class="handover-card">
+      <div><strong>${escapeHTML(child.name)}</strong>
+        <span>Pickup ${escapeHTML(child.pickup_status)} · Drop-off ${escapeHTML(child.dropoff_status)}</span></div>
       <div class="mini-actions">
-        <button data-child="${escapeHTML(child.child_id)}" data-type="picked_up" ${driver ? "" : "disabled"} type="button">Picked up</button>
-        <button data-child="${escapeHTML(child.child_id)}" data-type="dropped_off" ${driver ? "" : "disabled"} type="button">Dropped off</button>
-        <button class="ghost danger" data-child="${escapeHTML(child.child_id)}" data-type="absent" ${driver ? "" : "disabled"} type="button">Absent</button>
-      </div>
-    </article>`).join("");
+        <button data-child="${escapeHTML(child.child_id)}" data-type="${type}" ${disabled} type="button">${label}</button>
+        <button class="ghost danger" data-child="${escapeHTML(child.child_id)}" data-type="absent" ${disabled} type="button">Absent</button>
+      </div></article>`;
+  }).join("");
 }
 
 function renderSwapRequestPanel(trip) {
@@ -1069,10 +1097,10 @@ function renderSwapRequestPanel(trip) {
 function trackingMessage(trip, location) {
   if (state.watchId !== null) return "Tracking active. Your browser is sending driver GPS for this trip.";
   if (!trip) return "Tracking off. Select an active trip to see live GPS.";
-  if (trip.status === "started" && location) {
+  if (tripIsActive(trip) && location) {
     return location.message || (location.fresh ? "Live driver GPS is active." : "Driver GPS was received, but it may be stale.");
   }
-  if (trip.status === "started") return "Waiting for the driver's first GPS signal.";
+  if (tripIsActive(trip)) return "Waiting for the driver's first GPS signal.";
   return "Tracking off. The assigned driver must accept and start this trip first.";
 }
 
@@ -1087,7 +1115,7 @@ function renderTripMap(trip) {
       <div class="map map-empty">
         <div>
           <strong>Map waiting for GPS</strong>
-          <p>${trip.status === "started" ? "The map appears after the driver's browser sends the first location." : "Start the trip on its service date to enable live location."}</p>
+          <p>${tripIsActive(trip) ? "The map appears after the driver's browser sends the first location." : "Start the trip on its service date to enable live location."}</p>
         </div>
       </div>`;
     return;
@@ -1097,19 +1125,33 @@ function renderTripMap(trip) {
   const right = location.longitude + delta;
   const top = location.latitude + delta;
   const bottom = location.latitude - delta;
-  $("tripMap").innerHTML = `
+  const src = `https://www.openstreetmap.org/export/embed.html?bbox=${left}%2C${bottom}%2C${right}%2C${top}&layer=mapnik&marker=${location.latitude}%2C${location.longitude}`;
+  const summary = etaSummaryHTML(trip) || escapeHTML(location.message || (location.fresh ? "GPS fresh" : "GPS location received"));
+  const container = $("tripMap");
+  const frame = container.querySelector("iframe");
+  if (frame && frame.getAttribute("src") === src) {
+    // A new timestamp at the same coordinates is still a freshness update.
+    // Keep the loaded map; only its status and child-specific ETA need rendering.
+    const status = container.querySelector(".gps-map-status");
+    status.textContent = location.fresh ? "" : location.message;
+    status.hidden = location.fresh;
+    container.querySelector(".route-summary").innerHTML = summary;
+    return;
+  }
+  container.innerHTML = `
+    <p class="gps-map-status" role="status" ${location.fresh ? "hidden" : ""}>${location.fresh ? "" : escapeHTML(location.message)}</p>
     <div class="map-wrap">
       <iframe
         class="map"
         title="Driver map"
         loading="lazy"
         referrerpolicy="no-referrer-when-downgrade"
-        src="https://www.openstreetmap.org/export/embed.html?bbox=${left}%2C${bottom}%2C${right}%2C${top}&layer=mapnik&marker=${location.latitude}%2C${location.longitude}">
+        src="${src}">
       </iframe>
       <div class="vehicle-marker" aria-label="Driver GPS point" title="Driver GPS point">CAR</div>
     </div>
     <div class="route-summary">
-      ${etaSummaryHTML(trip) || escapeHTML(location.message || (location.fresh ? "GPS fresh" : "GPS location received"))}
+      ${summary}
     </div>`;
 }
 
@@ -1725,7 +1767,7 @@ async function startTrip() {
   if (!isTodayTrip(trip)) return toast("Trips can only be started on their service date.");
   try {
     await withButtonLock($("startTrip"), async () => {
-    if (trip.status !== "started") {
+    if (!tripIsActive(trip)) {
       const started = await api(`/api/trips/${trip.id}/start`, { method: "POST", body: "{}" });
       updateTripInState(started);
       rememberSelectedTrip(started.id);
@@ -1798,10 +1840,42 @@ async function stopTrackingForLogout() {
   }
 }
 
+function viewerIsVisible() {
+  return state.viewerActive !== false && !document.hidden;
+}
+
+function wireViewerEvents() {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopLocationPolling();
+    else refreshViewerOnResume();
+  });
+  window.addEventListener("pageshow", () => refreshViewerOnResume());
+  window.addEventListener("online", () => refreshViewerOnResume());
+}
+
+function refreshViewerOnResume() {
+  if (!state.token || !viewerIsVisible()) return;
+  if (Date.now() - state.lastViewerResumeAt < 1000 && state.locationPollId !== null) return state.viewerRefreshPromise;
+  state.lastViewerResumeAt = Date.now();
+  // Native resume and visibilitychange can arrive together. Invalidate suspended requests.
+  stopLocationPolling();
+  renderAll();
+  const trip = selectedTrip();
+  const active = tripIsActive(trip) ? trip : state.trips.find(tripIsActive);
+  if (active) active.next_route_refresh_at = 0;
+  reconcileLocationPolling(active);
+  if (state.viewerRefreshPromise) return state.viewerRefreshPromise;
+  state.viewerRefreshPromise = refreshGroupContext()
+    .catch((error) => reportClientError(error, { source: "viewer-resume" }))
+    .finally(() => { state.viewerRefreshPromise = null; });
+  return state.viewerRefreshPromise;
+}
+
 function reconcileLocationPolling(trip) {
-  if (trip && trip.status === "started" && state.trackingTripId !== trip.id) {
-    startLocationPolling(trip.id);
-  } else {
+  const active = tripIsActive(trip) ? trip : state.trips.find(tripIsActive);
+  if (viewerIsVisible() && active && state.trackingTripId !== active.id) {
+    startLocationPolling(active.id);
+  } else if (state.locationPollId !== null || state.locationPollTripId !== null) {
     stopLocationPolling();
   }
 }
@@ -1810,52 +1884,82 @@ function startLocationPolling(tripId) {
   if (state.locationPollTripId === tripId && state.locationPollId !== null) return;
   stopLocationPolling();
   state.locationPollTripId = tripId;
+  // Install the timer before fetching; rendering a response must not start another poll.
+  state.locationPollId = window.setInterval(() => {
+    renderHome();
+    renderTripConsole();
+    fetchLatestLocation(tripId);
+  }, 10000);
   fetchLatestLocation(tripId);
-  state.locationPollId = window.setInterval(() => fetchLatestLocation(tripId), 5000);
 }
 
 function stopLocationPolling() {
   if (state.locationPollId !== null) window.clearInterval(state.locationPollId);
   state.locationPollId = null;
   state.locationPollTripId = null;
-  state.locationPollInFlight = false;
-  state.routePollInFlight = false;
+  state.locationPollInFlight = null;
+  state.routePollInFlight = null;
 }
 
 async function fetchLatestLocation(tripId) {
-  if (state.locationPollInFlight) return;
-  state.locationPollInFlight = true;
+  if (state.locationPollInFlight || !viewerIsVisible()) return;
+  const request = {};
+  state.locationPollInFlight = request;
+  const started = performance.now();
+  let timeout;
   try {
-    const data = await api(`/api/trips/${tripId}/location`);
-    if (data && data.location) updateTripLocation(tripId, data.location, false);
+    const data = await Promise.race([
+      api(`/api/trips/${tripId}/location`),
+      new Promise((_, reject) => { timeout = window.setTimeout(() => reject(new Error("GPS refresh timed out")), 12000); }),
+    ]);
+    if (state.locationPollInFlight !== request || state.locationPollTripId !== tripId) return;
+    updateTripLocation(tripId, data && data.location ? data.location : null, false);
+    gpsDiagnostic("rendered", { request_ms: Math.round(performance.now() - started),
+      capture_age_seconds: data && data.location ? data.location.age_seconds : null });
     const trip = state.trips.find((item) => item.id === tripId);
-    if (trip && shouldFetchRoute(trip)) await fetchTripRoute(tripId);
+    if (trip && shouldFetchRoute(trip)) fetchTripRoute(tripId);
   } catch (error) {
-    reportClientError(error, { source: "location-poll" });
+    if (state.locationPollInFlight === request) reportClientError(error, { source: "location-poll" });
   } finally {
-    state.locationPollInFlight = false;
+    window.clearTimeout(timeout);
+    if (state.locationPollInFlight === request) state.locationPollInFlight = null;
   }
 }
 
+function gpsDiagnostic(stage, metrics) {
+  if (!nativeConfig.gpsDiagnostics) return;
+  // Callers supply durations/ages only, never coordinates, trip IDs or child data.
+  console.info("[gps]", { stage, at: new Date().toISOString(), ...metrics });
+}
+
 function shouldFetchRoute(trip) {
-  if (!trip || trip.status !== "started") return false;
+  if (!trip || !tripIsActive(trip)) return false;
   return Date.now() >= Number(trip.next_route_refresh_at || 0);
 }
 
 async function fetchTripRoute(tripId, { force = false } = {}) {
   const trip = state.trips.find((item) => item.id === tripId);
-  if (!trip || trip.status !== "started" || state.routePollInFlight) return;
+  if (!trip || !tripIsActive(trip) || state.routePollInFlight) return;
   if (!force && !shouldFetchRoute(trip)) return;
-  state.routePollInFlight = true;
+  const request = {};
+  state.routePollInFlight = request;
+  let timeout;
   trip.next_route_refresh_at = Date.now() + ROUTE_REFRESH_MS;
   try {
-    const data = await api(`/api/trips/${tripId}/route`);
+    const data = await Promise.race([
+      api(`/api/trips/${tripId}/route`),
+      new Promise((_, reject) => { timeout = window.setTimeout(() => reject(new Error("ETA refresh timed out")), 15000); }),
+    ]);
+    if (state.routePollInFlight !== request) return;
     updateTripRoute(tripId, data);
+    gpsDiagnostic("eta-rendered", { location_age_seconds: data && data.route ? data.route.location_age_seconds : null });
   } catch (error) {
+    if (state.routePollInFlight !== request) return;
     updateTripRoute(tripId, { route: null, message: "ETA temporarily unavailable" });
     reportClientError(error, { source: "route-poll" });
   } finally {
-    state.routePollInFlight = false;
+    window.clearTimeout(timeout);
+    if (state.routePollInFlight === request) state.routePollInFlight = null;
   }
 }
 
@@ -1941,12 +2045,12 @@ async function sendPositionNow(tripId, position) {
 
 function updateTripLocation(tripId, location, justUpdated = true) {
   const trip = state.trips.find((item) => item.id === tripId);
-  if (!trip || !location) return;
-  trip.latest_location = {
+  if (!trip) return;
+  trip.latest_location = location ? {
     ...location,
-    fresh: location.fresh !== undefined ? location.fresh : true,
-    message: justUpdated ? "GPS just updated" : location.message,
-  };
+    observed_at_ms: Date.now(),
+    message: justUpdated && location.fresh ? "GPS just updated" : location.message,
+  } : null;
   if (selectedTrip() && selectedTrip().id === tripId) renderTripConsole();
   renderHome();
 }
@@ -2152,7 +2256,10 @@ function wireNativeEvents() {
   const { App, PushNotifications } = nativePlugins();
   if (App && typeof App.addListener === "function") {
     App.addListener("appStateChange", (event) => {
+      state.viewerActive = Boolean(event && event.isActive);
+      if (!state.viewerActive) stopLocationPolling();
       if (event && event.isActive && state.token) {
+        refreshViewerOnResume();
         registerNativePushToken(false).catch(() => reportClientError(new Error("Push registration failed"), { source: "native-push-resume" }));
       }
     });
@@ -2306,7 +2413,7 @@ function clearLocalTrackingState() {
 }
 
 window.setInterval(() => {
-  if (state.token && !$("app").classList.contains("hidden")) {
+  if (state.token && viewerIsVisible() && !$("app").classList.contains("hidden")) {
     refreshGroupContext().catch(() => undefined);
   }
 }, 30000);

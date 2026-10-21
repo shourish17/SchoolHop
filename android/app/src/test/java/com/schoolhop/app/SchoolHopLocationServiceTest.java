@@ -85,6 +85,26 @@ public class SchoolHopLocationServiceTest {
         assertTrue(service.collecting);
     }
 
+    @Test public void delayedTripThatAlreadyStartedContinuesLockedScreenUploads() throws Exception {
+        service.serverState = "delayed";
+        service.serverStartedAt = Instant.now().minusSeconds(60).toString();
+        start();
+        Shadows.shadowOf(service.getSystemService(PowerManager.class)).setIsInteractive(false);
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(10));
+        fix();
+        assertTrue(service.collecting);
+        assertTrue(SchoolHopLocationService.running());
+        assertEquals(1, service.requests.stream().filter(c -> c.getRequestMethod().equals("POST")).count());
+        assertFalse(service.requests.get(0).getUseCaches());
+    }
+
+    @Test public void delayedTripThatNeverStartedDoesNotCollectGps() throws Exception {
+        service.serverState = "delayed";
+        start();
+        assertFalse(service.collecting);
+        assertFalse(SchoolHopLocationService.running());
+    }
+
     @Test public void screenOffAndDeviceIdleDoNotSwitchToWebViewOrStopNativeUploads() throws Exception {
         start();
         PowerManager power = service.getSystemService(PowerManager.class);
@@ -295,7 +315,7 @@ public class SchoolHopLocationServiceTest {
         boolean collecting, defer;
         int collectionStarts, uploadStatus = 200, validationStatus = 200;
         String serverState = "started", serverDriver = USER;
-        String serverDeadline, serverEndedAt, responseOverride;
+        String serverDeadline, serverEndedAt, serverStartedAt, responseOverride;
         final List<FakeConnection> requests = new ArrayList<>();
         final List<Runnable> jobs = new ArrayList<>();
         @Override protected FusedLocationProviderClient createLocationClient() { return null; }
@@ -308,6 +328,7 @@ public class SchoolHopLocationServiceTest {
         @Override protected HttpURLConnection openConnection(String url) throws Exception {
             String body = new JSONObject().put("status", serverState).put("driver_user_id", serverDriver)
                 .put("ended_at", serverEndedAt == null ? JSONObject.NULL : serverEndedAt)
+                .put("started_at", serverStartedAt == null ? JSONObject.NULL : serverStartedAt)
                 .put("safety_timeout_at", serverDeadline == null ? Instant.ofEpochMilli(System.currentTimeMillis() + 3600000).toString() : serverDeadline)
                 .put("private_address", "PRIVATE_ADDRESS").toString();
             FakeConnection connection = new FakeConnection(new URL(url), url.endsWith("/locations") ? uploadStatus : validationStatus,

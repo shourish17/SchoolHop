@@ -1,260 +1,156 @@
-name: Android Build
+name: Android Release AAB
 
 on:
   workflow_dispatch:
     inputs:
-      require_firebase:
-        description: Require Firebase configuration for push notifications. Disable only for development builds without push.
-        required: true
-        default: true
-        type: boolean
       version_name:
-        description: Optional Android versionName override.
-        required: false
+        description: Release versionName
+        required: true
+        default: '1.0.26'
         type: string
       version_code:
-        description: Optional Android versionCode override (minimum 9). Defaults to the GitHub run number; increase for each distributed build.
-        required: false
+        description: Reserved unused release versionCode
+        required: true
+        default: '11'
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: schoolhop-android-build-${{ github.ref }}
+  group: schoolhop-android-release
   cancel-in-progress: false
 
 jobs:
-  android:
+  release:
     runs-on: ubuntu-latest
     env:
-      ENVIRONMENT: test
-      EXPOSE_DEVELOPMENT_VERIFICATION_CODES: "true"
-      EMAIL_PROVIDER: smtp
-      SMTP_HOST: ""
-      SMTP_FROM_EMAIL: ""
-      JWT_SECRET: test-only-ci-secret
-      DATABASE_URL: postgresql://schoolhop:schoolhop@localhost:5432/schoolhop
-      ANDROID_VERSION_NAME: ${{ inputs.version_name || '1.0.25' }}
-      ANDROID_VERSION_CODE: ${{ inputs.version_code || github.run_number }}
-      ANDROID_REQUIRE_FIREBASE: ${{ inputs.require_firebase }}
+      ANDROID_VERSION_NAME: ${{ inputs.version_name }}
+      ANDROID_VERSION_CODE: ${{ inputs.version_code }}
+      ANDROID_REQUIRE_FIREBASE: 'true'
+      ANDROID_UPLOAD_CERT_SHA256: ${{ vars.ANDROID_UPLOAD_CERT_SHA256 }}
       ANDROID_DEBUG_CERT_SHA256: ${{ vars.ANDROID_DEBUG_CERT_SHA256 }}
       SCHOOLHOP_CAPACITOR_API_BASE_URL: https://schoolhop.shourish.com
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Verify GPS revision and version inputs
+      - name: Verify source and version
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor daa3c200f9f31ecdad4ed03fc1ad2da2fefcf8b9 HEAD
-          python3 - <<'PY'
+          git merge-base --is-ancestor bcbbd2dff2e8f14acffeba1753b7a5151b798171 HEAD
+          python3 - <<'PYTHON'
           import os, re
-          value = os.environ["ANDROID_VERSION_CODE"]
-          if not re.fullmatch(r"[1-9][0-9]*", value) or not 9 <= int(value) <= 2100000000:
-              raise SystemExit("Android versionCode must be an integer from 9 to 2100000000")
-          PY
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+          code, name = os.environ['ANDROID_VERSION_CODE'], os.environ['ANDROID_VERSION_NAME']
+          assert re.fullmatch(r'[1-9][0-9]*', code) and 11 <= int(code) <= 2100000000
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', name)
+          PYTHON
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: '21'
           cache: gradle
-
-      - name: Test Android signing validation
-        run: python3 -m unittest discover -s tests -p test_android_debug_signing.py -v
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
-
-      - name: Install Android SDK packages
-        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
-
-      - name: Install Node dependencies
-        run: npm ci
-
-      - name: Configure Firebase Android
+      - name: Install SDK and dependencies
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;35.0.0"
+          npm ci
+      - name: Frontend GPS, push, handover and deep-link regressions
+        run: |
+          npm test
+          npm run typecheck
+          npm run lint
+          python3 -m unittest discover -s tests -p test_android_debug_signing.py -v
+          python3 -m unittest discover -s tests -p test_android_release_signing.py -v
+      - name: Configure required Firebase
         env:
           ANDROID_GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}
         run: node scripts/configure-android-firebase.js
-
-      - name: Run frontend tests
-        run: npm test
-
-      - name: Run frontend typecheck
-        run: npm run typecheck
-
-      - name: Run frontend lint
-        run: npm run lint
-
-      - name: Install browser for layout regression tests
-        run: npx playwright install --with-deps chromium
-
-      - name: Check header layout and Sign Out
-        run: npm run test:layout
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt pytest pytest-asyncio
-
-      - name: Run backend regression tests
-        run: python -m unittest discover -s tests -v
-
-      - name: Compile backend modules
-        run: python -m py_compile app/main.py app/seed.py
-
-      - name: Build Capacitor web assets
-        run: npm run android:build
-
-      - name: Validate Capacitor config
-        run: npx cap config
-
-      - name: Sync Capacitor Android project
-        run: npx cap sync android
-
-      - name: Apply Android push startup guard
-        run: node scripts/patch-capacitor-android-push.js
-
-      - name: Verify Android manifest and version inputs
+      - name: Build Android assets and sync plugins
+        run: |
+          npm_package_version="$ANDROID_VERSION_NAME" node scripts/build-capacitor-web.js
+          npx cap sync android
+          node scripts/patch-capacitor-android-push.js
+      - name: Release JVM tests and lint
+        working-directory: android
+        run: ./gradlew --no-daemon --no-configuration-cache :app:testReleaseUnitTest :app:lintRelease
+      - name: Verify GPS deadline backport compatibility
+        run: python3 scripts/test_android_deadline_desugaring.py
+      - name: Verify unsigned releases are rejected
+        working-directory: android
         run: |
           set -euo pipefail
-          test -f android/app/src/main/AndroidManifest.xml
-          grep -q 'android.permission.ACCESS_FINE_LOCATION' android/app/src/main/AndroidManifest.xml
-          grep -q 'android.permission.ACCESS_BACKGROUND_LOCATION' android/app/src/main/AndroidManifest.xml
-          grep -q 'android.permission.FOREGROUND_SERVICE_LOCATION' android/app/src/main/AndroidManifest.xml
-          grep -q 'android:foregroundServiceType="location"' android/app/src/main/AndroidManifest.xml
-          if ! [[ "$ANDROID_VERSION_CODE" =~ ^[0-9]+$ ]]; then
-            echo "::error::ANDROID_VERSION_CODE must be numeric."
+          if ./gradlew --no-daemon --no-configuration-cache :app:bundleRelease > "$RUNNER_TEMP/unsigned-release-check.log" 2>&1; then
+            echo '::error::Release signing accepted missing credentials'
             exit 1
           fi
-          echo "Commit SHA: $GITHUB_SHA"
-          echo "Application ID: com.schoolhop.app"
-          echo "Version name: $ANDROID_VERSION_NAME"
-          echo "Version code: $ANDROID_VERSION_CODE"
-
-      - name: Stage and verify persistent debug signing identity
-        env:
-          ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
-          ANDROID_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEYSTORE_PASSWORD }}
-          ANDROID_DEBUG_KEY_ALIAS: ${{ secrets.ANDROID_DEBUG_KEY_ALIAS }}
-          ANDROID_DEBUG_KEY_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
-        run: python3 scripts/android_debug_signing.py stage
-
-      - name: Build debug APK
-        working-directory: android
-        env:
-          ANDROID_DEBUG_KEYSTORE_PATH: ${{ runner.temp }}/schoolhop-debug-signing/debug-signing.p12
-          ANDROID_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEYSTORE_PASSWORD }}
-          ANDROID_DEBUG_KEY_ALIAS: ${{ secrets.ANDROID_DEBUG_KEY_ALIAS }}
-          ANDROID_DEBUG_KEY_PASSWORD: ${{ secrets.ANDROID_DEBUG_KEY_PASSWORD }}
-        run: ./gradlew --no-daemon --no-configuration-cache assembleDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest
-
-      - name: Test deadline compatibility with Build 9 desugaring
-        run: python3 scripts/test_android_deadline_desugaring.py
-
-      - name: Verify signed APK and packaged configuration
-        run: >-
-          python3 scripts/android_debug_signing.py verify-apk
-          android/app/build/outputs/apk/debug/app-debug.apk
-          --build-tools "$ANDROID_HOME/build-tools/35.0.0"
-
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: schoolhop-android-debug-${{ github.sha }}
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-
-      - name: Check Android signing secrets
-        id: android-signing
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Decode Android upload keystore
-        if: ${{ steps.android-signing.outputs.configured == 'true' }}
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          grep -q 'Persistent Android upload signing credentials are required' "$RUNNER_TEMP/unsigned-release-check.log"
+      - name: Install pinned bundletool
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/android-signing"
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/android-signing/upload-keystore.jks"
-          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/android-signing/upload-keystore.jks" >> "$GITHUB_ENV"
-
-      - name: Build signed release AAB
-        if: ${{ steps.android-signing.outputs.configured == 'true' }}
-        working-directory: android
+          curl -fsSL -o "$RUNNER_TEMP/bundletool.jar" https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
+          echo '2d4ad908faea64047c1cc9cb747e6aa667c6ab192e09607bd16b67246a8cd6ae  '"$RUNNER_TEMP/bundletool.jar" | sha256sum --check
+      - name: Stage and verify persistent upload identity
         env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew --no-daemon bundleRelease
-
-      - name: Upload release AAB
-        if: ${{ steps.android-signing.outputs.configured == 'true' }}
+        run: python3 scripts/android_release_signing.py stage
+      - name: Build signed release AAB
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/schoolhop-upload-signing/upload-signing.p12
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --no-configuration-cache bundleRelease
+      - name: Verify actual release bundle
+        run: >-
+          python3 scripts/android_release_signing.py verify
+          android/app/build/outputs/bundle/release/app-release.aab
+          --bundletool "$RUNNER_TEMP/bundletool.jar"
+          --report android-release-verification.json
+      - name: Upload verified signed AAB
+        id: aab
         uses: actions/upload-artifact@v4
         with:
-          name: schoolhop-android-release-aab-${{ github.sha }}
-          path: android/app/build/outputs/bundle/release/app-release.aab
+          name: schoolhop-android-release-${{ env.ANDROID_VERSION_NAME }}-${{ env.ANDROID_VERSION_CODE }}-${{ github.sha }}
+          path: |
+            android/app/build/outputs/bundle/release/app-release.aab
+            android-release-verification.json
           if-no-files-found: error
-
-      - name: Report unsigned release status
-        if: ${{ steps.android-signing.outputs.configured != 'true' }}
-        run: |
-          echo "::notice::Android signing secrets are not configured. Debug APK was built; signed release AAB is pending ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD."
-
-      - name: Git diff whitespace check
-        run: git diff --check
-
-      - name: Remove staged Firebase configuration
+          retention-days: 90
+      - name: Upload release test reports
         if: always()
-        run: rm -f android/app/google-services.json
-
-      - name: Remove temporary signing material
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-checks-${{ github.run_id }}
+          path: |
+            android/app/build/reports/tests/testReleaseUnitTest/
+            android/app/build/reports/lint-results-release.html
+            android/app/build/reports/lint-results-release.xml
+          if-no-files-found: warn
+      - name: Remove temporary credentials
         if: always()
         run: |
-          rm -rf -- "$RUNNER_TEMP/schoolhop-debug-signing" "$RUNNER_TEMP/android-signing"
-
-      - name: Build summary
+          rm -rf -- "$RUNNER_TEMP/schoolhop-upload-signing"
+          rm -f android/app/google-services.json
+      - name: Release summary
+        env:
+          ARTIFACT_URL: ${{ steps.aab.outputs.artifact-url }}
         run: |
-          {
-            echo "## Android Build"
-            echo "- Commit SHA: \`$GITHUB_SHA\`"
-            echo "- Application ID: \`com.schoolhop.app\`"
-            echo "- Firebase required: \`$ANDROID_REQUIRE_FIREBASE\`"
-            echo "- Version name: \`$ANDROID_VERSION_NAME\`"
-            echo "- Version code: \`$ANDROID_VERSION_CODE\`"
-            echo "- Debug APK artifact: \`schoolhop-android-debug-$GITHUB_SHA\`"
-            echo "- Debug signing verification: passed"
-            echo "- Debug certificate SHA-256: \`$ANDROID_DEBUG_CERT_SHA256\`"
-            if [ "${{ steps.android-signing.outputs.configured }}" = "true" ]; then
-              echo "- Release AAB artifact: \`schoolhop-android-release-aab-$GITHUB_SHA\`"
-              echo "- Signing: configured"
-            else
-              echo "- Release AAB artifact: pending signing credentials"
-              echo "- Signing: not configured"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYTHON'
+          import os
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('## Verified signed Android release AAB\n\n')
+              for key in ['GITHUB_SHA', 'ANDROID_VERSION_NAME', 'ANDROID_VERSION_CODE', 'ANDROID_UPLOAD_CERT_SHA256', 'ARTIFACT_URL']:
+                  output.write(f"- {key}: {os.environ[key]}\n")
+              output.write('- Application ID: com.schoolhop.app\n- Play upload: not performed\n')
+          PYTHON

@@ -12,6 +12,33 @@ if (!(requestedVersionCode ==~ /[1-9][0-9]*/) || requestedVersionCode.toBigInteg
     throw new GradleException("Android versionCode must be an integer from 9 to 2100000000")
 }
 def persistentDebugConfigured = debugCredentials.every { it }
+def releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+def releaseStorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+def releaseKeyAlias = System.getenv("ANDROID_KEY_ALIAS")
+def releaseKeyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+def releaseCertificateSha256 = System.getenv("ANDROID_UPLOAD_CERT_SHA256")
+def releaseCredentials = [releaseKeystorePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+def releaseConfigured = releaseCredentials.every { it }
+if (releaseCredentials.any { it } && !releaseConfigured) {
+    throw new GradleException("All Android upload signing credentials are required")
+}
+if (releaseConfigured) {
+    if (!(releaseCertificateSha256 ==~ /[0-9a-f]{64}/) || releaseCertificateSha256 == debugCertificateSha256) {
+        throw new GradleException("A separate pinned Android upload certificate SHA-256 is required")
+    }
+    try {
+        def keystore = java.security.KeyStore.getInstance(file(releaseKeystorePath), releaseStorePassword.toCharArray())
+        def certificate = keystore.getCertificate(releaseKeyAlias)
+        def signingKey = keystore.getKey(releaseKeyAlias, releaseKeyPassword.toCharArray())
+        def actual = certificate == null ? null : java.security.MessageDigest.getInstance("SHA-256")
+            .digest(certificate.encoded).encodeHex().toString()
+        if (!(signingKey instanceof java.security.PrivateKey) || actual != releaseCertificateSha256) {
+            throw new IllegalStateException()
+        }
+    } catch (Exception ignored) {
+        throw new GradleException("Android upload signing identity could not be verified")
+    }
+}
 if (debugCredentials.any { it } && !persistentDebugConfigured) {
     throw new GradleException("All dedicated Android debug signing credentials are required")
 }
@@ -60,15 +87,12 @@ android {
             }
         }
         release {
-            def keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
-            def keystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
-            def keyAliasValue = System.getenv("ANDROID_KEY_ALIAS")
-            def keyPasswordValue = System.getenv("ANDROID_KEY_PASSWORD")
-            if (keystorePath && keystorePassword && keyAliasValue && keyPasswordValue) {
-                storeFile file(keystorePath)
-                storePassword keystorePassword
-                keyAlias keyAliasValue
-                keyPassword keyPasswordValue
+            if (releaseConfigured) {
+                storeFile file(releaseKeystorePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                storeType "PKCS12"
             }
         }
     }
@@ -78,9 +102,7 @@ android {
         }
         release {
             minifyEnabled false
-            if (signingConfigs.release.storeFile != null) {
-                signingConfig signingConfigs.release
-            }
+            signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
@@ -94,7 +116,17 @@ android {
 
 // Never fall back to an automatically generated key for an installable debug APK.
 // Release-only builds do not need access to the debug private key.
+def verifyReleaseUploadSigning = tasks.register("verifyReleaseUploadSigning") {
+    doLast {
+        if (!releaseConfigured) {
+            throw new GradleException("Persistent Android upload signing credentials are required for release builds")
+        }
+    }
+}
 tasks.configureEach {
+    if (name in ["bundleRelease", "packageRelease", "packageReleaseBundle", "signReleaseBundle", "validateSigningRelease"]) {
+        dependsOn verifyReleaseUploadSigning
+    }
     if (name == "validateSigningDebug") {
         outputs.upToDateWhen { false }
         outputs.cacheIf { false }

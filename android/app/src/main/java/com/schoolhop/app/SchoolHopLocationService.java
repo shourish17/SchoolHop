@@ -203,7 +203,7 @@ public class SchoolHopLocationService extends Service {
         if (locationCallback != null) return;
         LocationRequest request = new LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, LOCATION_INTERVAL_MS)
             .setMinUpdateIntervalMillis(LOCATION_INTERVAL_MS)
-            .setMinUpdateDistanceMeters(0) // Fresh stationary fixes keep server age below 240 seconds.
+            .setMinUpdateDistanceMeters(0) // Fresh stationary fixes keep the server timestamp current.
             .setMaxUpdateDelayMillis(0)
             .setMaxUpdateAgeMillis(0)
             .build();
@@ -254,7 +254,9 @@ public class SchoolHopLocationService extends Service {
                 try {
                     JSONObject trip = new JSONObject(body);
                     long safetyUntil = SchoolHopSafetyDeadline.parseMillis(trip.getString("safety_timeout_at"));
-                    if (!"started".equals(trip.getString("status")) || !trip.isNull("ended_at")) {
+                    boolean active = "started".equals(trip.getString("status"))
+                        || ("delayed".equals(trip.getString("status")) && !trip.isNull("started_at"));
+                    if (!active || !trip.isNull("ended_at")) {
                         validationFailure = ValidationFailure.TRIP_NOT_ACTIVE;
                     } else if (!requested.userId.equals(trip.getString("driver_user_id"))) {
                         validationFailure = ValidationFailure.DRIVER_MISMATCH;
@@ -322,6 +324,8 @@ public class SchoolHopLocationService extends Service {
         HttpURLConnection request = openConnection(requested.endpoint(upload));
         connection = request;
         try {
+            request.setUseCaches(false);
+            request.setRequestProperty("Cache-Control", "no-store");
             request.setInstanceFollowRedirects(false); // Never forward bearer credentials to redirects.
             request.setRequestMethod(upload ? "POST" : "GET");
             request.setConnectTimeout(8000);

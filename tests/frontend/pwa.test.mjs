@@ -25,9 +25,9 @@ test("service worker caches the current app shell version", async () => {
   const html = await read("app/static/index.html");
   const worker = await read("app/static/service-worker.js");
 
-  assert.match(html, /\/static\/app\.js\?v=29/);
-  assert.match(worker, /schoolhop-shell-v29/);
-  assert.match(worker, /\/static\/app\.js\?v=29/);
+  assert.match(html, /\/static\/app\.js\?v=30/);
+  assert.match(worker, /schoolhop-shell-v30/);
+  assert.match(worker, /\/static\/app\.js\?v=30/);
 });
 
 test("registration UI uses verified account creation flow", async () => {
@@ -94,7 +94,7 @@ test("navigation, trip map, history, and driver actions match roster workflow", 
   assert.match(app, /ETA to School/);
   assert.match(app, /ETA temporarily unavailable/);
   assert.match(app, /vehicle-marker/);
-  assert.match(app, /const startedTrips = trips\.filter\(\(trip\) => trip\.status === "started"\)/);
+  assert.match(app, /const startedTrips = trips\.filter\(\(trip\) => tripIsActive\(trip\)\)/);
   assert.match(html, /Current Trip/);
   assert.match(html, /Next Trip/);
   assert.match(app, /data-tracking="\$\{tracking \? "on" : "off"\}"/);
@@ -174,7 +174,7 @@ test("route polling asks backend even when local GPS freshness is stale", async 
   const app = await read("app/static/app.js");
 
   assert.match(app, /function shouldFetchRoute\(trip\)/);
-  assert.match(app, /if \(!trip \|\| trip\.status !== "started"\) return false/);
+  assert.match(app, /if \(!trip \|\| !tripIsActive\(trip\)\) return false/);
   assert.doesNotMatch(app, /!location \|\| !location\.fresh/);
   assert.match(app, /trip\.route_reason = data && data\.reason \? data\.reason : null/);
 });

@@ -61,6 +61,14 @@ public class SchoolHopLocationTrackerTest {
         assertTrue(host.collecting);
     }
 
+    @Test public void stationaryCoordinatesWithNewCaptureTimeAreUploadedAgain() {
+        tracker.start();
+        tracker.offer("same-stationary-coordinates", host.clock);
+        host.advance(10000);
+        tracker.offer("same-stationary-coordinates", host.clock);
+        assertEquals(2, host.uploads.size());
+    }
+
     @Test public void latestQueuedFixDrainsWithoutAnotherGpsCallback() {
         tracker.start();
         tracker.offer("first", host.clock);
