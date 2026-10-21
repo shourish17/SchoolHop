@@ -56,6 +56,7 @@ let notificationAudioContext = null;
 let notificationAudioElement = null;
 let nativePushQueue = Promise.resolve();
 let nativePushRegistration = null;
+const androidHandovers = new Map();
 
 const $ = (id) => document.getElementById(id);
 const nativeConfig = window.SCHOOLHOP_NATIVE_CONFIG || {};
@@ -80,6 +81,8 @@ function toast(message) {
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  // Capacitor's native HTTP bridge forwards headers, but not fetch's cache option.
+  if (nativePlatform() === "android") headers["Cache-Control"] = "no-store";
   if (state.token && !headers.Authorization) headers.Authorization = `Bearer ${state.token}`;
   const started = performance.now();
   const response = await fetch(apiUrl(path), { ...options, headers, cache: "no-store" });
@@ -266,6 +269,7 @@ function tripStatusLabel(trip) {
 }
 
 function mapLocation(trip) {
+  if (!canViewTripTracking(trip)) return null;
   const location = trip && trip.latest_location;
   if (!location || location.latitude == null || location.longitude == null) return null;
   const latitude = Number(location.latitude);
@@ -327,7 +331,7 @@ function etaTitle(route) {
 }
 
 function etaSummaryHTML(trip) {
-  if (!trip || !tripIsActive(trip)) return "";
+  if (!trip || !tripIsActive(trip) || !canViewTripTracking(trip)) return "";
   const location = mapLocation(trip);
   const route = trip.latest_route;
   const lastLocation = lastLocationLabel(trip);
@@ -972,7 +976,12 @@ function renderTrips() {
 
 function tripCard(trip, selectable = true) {
   const driverLabel = (trip.driver && trip.driver.name) || "Assigned driver";
-  const children = trip.children.map((child) => `${child.name}: pickup ${child.pickup_status}, drop-off ${child.dropoff_status}`).join("; ");
+  const children = trip.children.map((child) => {
+    const status = childHandoverStatus(trip, child);
+    const pickup = trip.trip_type === "pickup" ? status : child.pickup_status;
+    const dropoff = trip.trip_type === "dropoff" ? status : child.dropoff_status;
+    return `${child.name}: pickup ${pickup}, drop-off ${dropoff}`;
+  }).join("; ");
   const response = trip.my_response ? pill(trip.my_response.status, statusTone(trip.my_response.status)) : "";
   const selected = selectedTrip();
   const active = selectable && selected && selected.id === trip.id ? " selected" : "";
@@ -1054,18 +1063,41 @@ function renderTripConsole() {
 
 function handoverButtonsHTML(trip, driver) {
   const type = trip.trip_type === "pickup" ? "picked_up" : "dropped_off";
-  const label = type === "picked_up" ? "Picked up" : "Dropped off";
+  const label = nativePlatform() === "android"
+    ? (type === "picked_up" ? "Picked Up" : "Dropped Off")
+    : (type === "picked_up" ? "Picked up" : "Dropped off");
   return trip.children.map((child) => {
-    const status = trip.trip_type === "pickup" ? child.pickup_status : child.dropoff_status;
-    const disabled = !driver || status !== "pending" ? "disabled" : "";
+    const status = childHandoverStatus(trip, child);
+    const disabled = !driver || status !== "pending" || androidHandoverState(trip, child) ? "disabled" : "";
+    const pickup = trip.trip_type === "pickup" ? status : child.pickup_status;
+    const dropoff = trip.trip_type === "dropoff" ? status : child.dropoff_status;
     return `<article class="handover-card">
       <div><strong>${escapeHTML(child.name)}</strong>
-        <span>Pickup ${escapeHTML(child.pickup_status)} · Drop-off ${escapeHTML(child.dropoff_status)}</span></div>
+        <span>Pickup ${escapeHTML(pickup)} · Drop-off ${escapeHTML(dropoff)}</span></div>
       <div class="mini-actions">
         <button data-child="${escapeHTML(child.child_id)}" data-type="${type}" ${disabled} type="button">${label}</button>
         <button class="ghost danger" data-child="${escapeHTML(child.child_id)}" data-type="absent" ${disabled} type="button">Absent</button>
       </div></article>`;
   }).join("");
+}
+
+function androidHandoverKey(trip, child) {
+  return `${state.me.id}:${trip.id}:${child.child_id}`;
+}
+
+function androidHandoverState(trip, child) {
+  return nativePlatform() === "android" ? androidHandovers.get(androidHandoverKey(trip, child)) : null;
+}
+
+function childHandoverStatus(trip, child) {
+  const acknowledged = androidHandoverState(trip, child);
+  return (acknowledged && acknowledged.status) || (trip.trip_type === "pickup" ? child.pickup_status : child.dropoff_status);
+}
+
+function canViewTripTracking(trip) {
+  if (!trip || nativePlatform() !== "android" || isDriver(trip)) return true;
+  const ownChildren = (trip.children || []).filter((child) => state.me && child.parent_id === state.me.id);
+  return !ownChildren.length || ownChildren.some((child) => childHandoverStatus(trip, child) === "pending");
 }
 
 function renderSwapRequestPanel(trip) {
@@ -1095,6 +1127,7 @@ function renderSwapRequestPanel(trip) {
 }
 
 function trackingMessage(trip, location) {
+  if (!canViewTripTracking(trip)) return "Handover completed. Live tracking for your children has ended.";
   if (state.watchId !== null) return "Tracking active. Your browser is sending driver GPS for this trip.";
   if (!trip) return "Tracking off. Select an active trip to see live GPS.";
   if (tripIsActive(trip) && location) {
@@ -1105,6 +1138,10 @@ function trackingMessage(trip, location) {
 }
 
 function renderTripMap(trip) {
+  if (!canViewTripTracking(trip)) {
+    $("tripMap").innerHTML = empty("Handover completed. Live tracking for your children has ended.");
+    return;
+  }
   if (!trip) {
     $("tripMap").innerHTML = empty("Select an active trip to see its map.");
     return;
@@ -1872,7 +1909,8 @@ function refreshViewerOnResume() {
 }
 
 function reconcileLocationPolling(trip) {
-  const active = tripIsActive(trip) ? trip : state.trips.find(tripIsActive);
+  const eligible = (item) => tripIsActive(item) && canViewTripTracking(item);
+  const active = eligible(trip) ? trip : state.trips.find(eligible);
   if (viewerIsVisible() && active && state.trackingTripId !== active.id) {
     startLocationPolling(active.id);
   } else if (state.locationPollId !== null || state.locationPollTripId !== null) {
@@ -1939,7 +1977,7 @@ function shouldFetchRoute(trip) {
 
 async function fetchTripRoute(tripId, { force = false } = {}) {
   const trip = state.trips.find((item) => item.id === tripId);
-  if (!trip || !tripIsActive(trip) || state.routePollInFlight) return;
+  if (!trip || !tripIsActive(trip) || !canViewTripTracking(trip) || state.routePollInFlight) return;
   if (!force && !shouldFetchRoute(trip)) return;
   const request = {};
   state.routePollInFlight = request;
@@ -2070,6 +2108,7 @@ async function onHandoverClick(event) {
   if (!button) return;
   const trip = selectedTrip();
   if (!trip) return toast("Select a trip first");
+  if (nativePlatform() === "android") return submitAndroidHandover(trip, button);
   try {
     await withButtonLock(button, async () => api(`/api/trips/${trip.id}/children/${button.dataset.child}/handover`, {
       method: "POST",
@@ -2081,6 +2120,45 @@ async function onHandoverClick(event) {
     toast("Handover recorded");
   } catch (error) {
     toast(error.message);
+  }
+}
+
+async function submitAndroidHandover(trip, button) {
+  const child = trip.children.find((item) => item.child_id === button.dataset.child);
+  const action = button.dataset.type;
+  const expected = trip.trip_type === "pickup" ? "picked_up" : "dropped_off";
+  if (!child || button.disabled || !isDriver(trip) || ![expected, "absent"].includes(action)
+      || childHandoverStatus(trip, child) !== "pending" || androidHandoverState(trip, child)) return;
+  const key = androidHandoverKey(trip, child);
+  const submission = {};
+  androidHandovers.set(key, submission);
+  renderAll(); // Both actions stay locked even when a GPS render replaces their DOM nodes.
+  try {
+    await api(`/api/trips/${trip.id}/children/${child.child_id}/handover`, {
+      method: "POST", body: JSON.stringify({ handover_type: action }),
+    });
+    // The server has committed. A failed detail refresh or an older in-flight snapshot
+    // must not offer a contradictory action. Reopening obtains the persisted server status.
+    submission.status = action;
+    try {
+      updateTripInState(await api(`/api/trips/${trip.id}`));
+    } catch (error) {
+      reportClientError(error, { source: "handover-refresh" });
+    }
+    toast("Handover recorded");
+  } catch (error) {
+    // Reconcile an already-completed action (including a lost POST response) before retry.
+    try {
+      const updated = await api(`/api/trips/${trip.id}`);
+      updateTripInState(updated);
+      const completed = updated.children.find((item) => item.child_id === child.child_id);
+      const status = completed && childHandoverStatus(updated, completed);
+      if (status && status !== "pending") submission.status = status;
+    } catch { /* Refresh remains retryable; the server enforces idempotency and conflicts. */ }
+    toast(error.message);
+  } finally {
+    if (!submission.status) androidHandovers.delete(key);
+    renderAll();
   }
 }
 

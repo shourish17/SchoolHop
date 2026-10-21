@@ -26,7 +26,7 @@ function harness() {
   const context = vm.createContext({
     state, window, document, performance: { now: () => now },
     Date: class extends Date { static now() { return now; } },
-    nativeConfig: {}, console, selectedTrip: () => trip,
+    nativeConfig: {}, nativePlatform: () => "web", console, selectedTrip: () => trip,
     renderHome() {}, renderTripConsole() {}, renderAll() {},
     refreshGroupContext: async () => { calls.push("group"); },
     reportClientError: () => calls.push("error"), shouldFetchRoute: () => false,
