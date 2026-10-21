@@ -11,7 +11,7 @@ on:
       version_code:
         description: Reserved unused release versionCode
         required: true
-        default: '11'
+        default: '12'
         type: string
 
 permissions:
@@ -42,7 +42,7 @@ jobs:
           python3 - <<'PYTHON'
           import os, re
           code, name = os.environ['ANDROID_VERSION_CODE'], os.environ['ANDROID_VERSION_NAME']
-          assert re.fullmatch(r'[1-9][0-9]*', code) and 11 <= int(code) <= 2100000000
+          assert re.fullmatch(r'[1-9][0-9]*', code) and 12 <= int(code) <= 2100000000
           assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', name)
           PYTHON
       - uses: actions/setup-node@v4

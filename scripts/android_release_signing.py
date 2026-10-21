@@ -74,6 +74,8 @@ def verify(bundle, bundletool, report):
     assert manifest.get("package") == "com.schoolhop.app"
     assert manifest.get(android + "versionCode") == code
     assert manifest.get(android + "versionName") == name
+    sdk = manifest.find("uses-sdk")
+    assert sdk is not None and sdk.get(android + "minSdkVersion") == "24"
     app = manifest.find("application")
     assert app is not None and app.get(android + "debuggable", "false") == "false"
     assert app.get(android + "usesCleartextTraffic") == "false"
@@ -111,9 +113,10 @@ def verify(bundle, bundletool, report):
         assert "server" not in config or "url" not in config["server"]
         assert b"com.schoolhop.app.SchoolHopPushNotificationsPlugin" in archive.read("base/assets/capacitor.plugins.json")
     result = {"application_id": "com.schoolhop.app", "version_code": int(code), "version_name": name,
+        "min_sdk_version": 24,
         "commit": required("GITHUB_SHA"), "upload_certificate_sha256": expected,
         "aab_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(), "checks": ["all payload entries cryptographically signed",
-        "pinned upload certificate", "jarsigner", "bundletool validate", "release manifest and version",
+        "pinned upload certificate", "jarsigner", "bundletool validate", "release manifest and version", "minSdkVersion 24",
         "GPS and background location", "FCM configuration and service", "HTTPS and custom deep links",
         "packaged frontend matches source", "production API URL", "Capacitor plugins"],
         "play_uploaded": False, "device_tests": "not run"}

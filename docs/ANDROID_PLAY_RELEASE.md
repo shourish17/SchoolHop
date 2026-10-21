@@ -1,10 +1,10 @@
 # Google Play Internal Testing release preparation
 
-Release candidate: `release/android-internal-20261021`; application ID
-`com.schoolhop.app`; versionName **1.0.26**, versionCode **11**. The latest
-successful distributed Android build used code 10. Code 11 is reserved for this
-candidate; do not distribute another build with this code. No Play Console access
-was available to rule out uploads made outside this repository.
+Release candidate: `release/android-minsdk24-20261021`; application ID
+`com.schoolhop.app`; versionName **1.0.26**, versionCode **12**, minSdkVersion
+**24**. This replaces code 11, rejected by Google Play because automatic
+protection requires API 24. Code 12 is reserved for this candidate; do not
+distribute another build with this code.
 
 The candidate starts at successful Android commit `bcbbd2d` and includes the
 current workspace's native delayed-trip GPS/no-cache fixes and shared frontend
@@ -82,7 +82,7 @@ scheme and notification action routing are retained and checked in source.
 ## Build and verification
 
 Dispatch `.github/workflows/android-build.yml` on this release branch, with
-`version_name=1.0.26` and `version_code=11`. It performs frontend tests,
+`version_name=1.0.26` and `version_code=12`. It performs frontend tests,
 typechecking/lint, real cryptographic verification boundary tests, release JVM
 tests, Android release lint, GPS deadline desugaring checks, and a check that
 Gradle rejects release signing without credentials. Only then does it stage the
@@ -95,7 +95,7 @@ files are removed on success or failure, and configuration caching is disabled.
 The completed bundle must pass `jarsigner`, bundletool validation, and Java
 `JarFile` signature verification of **every payload entry**, rejecting unsigned
 additions, changed payloads or a different signer. Inspection also validates
-package/version, release flags, location/background/foreground-service
+package/version, minSdkVersion 24, release flags, location/background/foreground-service
 permissions, Firebase resources and messaging service, deep-link declarations,
 Capacitor plugins, the production API URL and packaged frontend/source equality.
 
