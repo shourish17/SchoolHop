@@ -11,7 +11,7 @@ on:
       version_code:
         description: Reserved unused release versionCode
         required: true
-        default: '12'
+        default: '13'
         type: string
 
 permissions:
@@ -39,10 +39,12 @@ jobs:
         run: |
           set -euo pipefail
           git merge-base --is-ancestor bcbbd2dff2e8f14acffeba1753b7a5151b798171 HEAD
+          git merge-base --is-ancestor fbec71655e0660681c6181132021a795fc57482d HEAD
+          git diff --exit-code fbec71655e0660681c6181132021a795fc57482d -- app/static android/app/src ios capacitor.config.json package.json package-lock.json scripts/build-capacitor-web.js
           python3 - <<'PYTHON'
           import os, re
           code, name = os.environ['ANDROID_VERSION_CODE'], os.environ['ANDROID_VERSION_NAME']
-          assert re.fullmatch(r'[1-9][0-9]*', code) and 12 <= int(code) <= 2100000000
+          assert re.fullmatch(r'[1-9][0-9]*', code) and 13 <= int(code) <= 2100000000
           assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', name)
           PYTHON
       - uses: actions/setup-node@v4
@@ -68,6 +70,10 @@ jobs:
           npm run lint
           python3 -m unittest discover -s tests -p test_android_debug_signing.py -v
           python3 -m unittest discover -s tests -p test_android_release_signing.py -v
+      - name: Android handover and iOS preservation browser regressions
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test tests/layout/android-handover.spec.mjs --workers=2 --reporter=line
       - name: Configure required Firebase
         env:
           ANDROID_GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON_BASE64 }}

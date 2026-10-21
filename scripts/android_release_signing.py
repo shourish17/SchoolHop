@@ -11,6 +11,10 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
+REVIEWED_FRONTEND_COMMIT = "fbec71655e0660681c6181132021a795fc57482d"
+REVIEWED_FRONTEND_SHA256 = "44cae38a82be9d3e9bfc5f4a7bfa2bf68c4c58d0536cbff6062d049da7be620d"
+
+
 def required(name):
     value = os.environ.get(name)
     if not value:
@@ -107,6 +111,8 @@ def verify(bundle, bundletool, report):
         assert re.findall(r'appVersion:\s*"([^"\n]+)"', index) == [name]
         for filename in ["app.js", "service-worker.js", "styles.css"]:
             assert archive.read("base/assets/public/static/" + filename) == Path("app/static", filename).read_bytes()
+        frontend_sha256 = hashlib.sha256(archive.read("base/assets/public/static/app.js")).hexdigest()
+        assert frontend_sha256 == REVIEWED_FRONTEND_SHA256
         config = json.loads(archive.read("base/assets/capacitor.config.json"))
         assert config["appId"] == "com.schoolhop.app"
         assert config["plugins"]["CapacitorHttp"]["enabled"] is True
@@ -114,11 +120,12 @@ def verify(bundle, bundletool, report):
         assert b"com.schoolhop.app.SchoolHopPushNotificationsPlugin" in archive.read("base/assets/capacitor.plugins.json")
     result = {"application_id": "com.schoolhop.app", "version_code": int(code), "version_name": name,
         "min_sdk_version": 24,
+        "reviewed_frontend_commit": REVIEWED_FRONTEND_COMMIT, "packaged_app_js_sha256": frontend_sha256,
         "commit": required("GITHUB_SHA"), "upload_certificate_sha256": expected,
         "aab_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(), "checks": ["all payload entries cryptographically signed",
         "pinned upload certificate", "jarsigner", "bundletool validate", "release manifest and version", "minSdkVersion 24",
         "GPS and background location", "FCM configuration and service", "HTTPS and custom deep links",
-        "packaged frontend matches source", "production API URL", "Capacitor plugins"],
+        "packaged frontend matches source", "reviewed handover UI and parent tracking", "production API URL", "Capacitor plugins"],
         "play_uploaded": False, "device_tests": "not run"}
     report.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

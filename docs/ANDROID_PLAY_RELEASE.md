@@ -1,10 +1,10 @@
 # Google Play Internal Testing release preparation
 
-Release candidate: `release/android-minsdk24-20261021`; application ID
-`com.schoolhop.app`; versionName **1.0.26**, versionCode **12**, minSdkVersion
-**24**. This replaces code 11, rejected by Google Play because automatic
-protection requires API 24. Code 12 is reserved for this candidate; do not
-distribute another build with this code.
+Release candidate: `release/android-handover-13-20261021`; application ID
+`com.schoolhop.app`; versionName **1.0.26**, versionCode **13**, minSdkVersion
+**24**. This includes the reviewed handover fix at `fbec716` without changing
+its frontend or native implementation. Code 13 is reserved for this candidate;
+do not distribute another build with this code.
 
 The candidate starts at successful Android commit `bcbbd2d` and includes the
 current workspace's native delayed-trip GPS/no-cache fixes and shared frontend
@@ -82,11 +82,18 @@ scheme and notification action routing are retained and checked in source.
 ## Build and verification
 
 Dispatch `.github/workflows/android-build.yml` on this release branch, with
-`version_name=1.0.26` and `version_code=12`. It performs frontend tests,
+`version_name=1.0.26` and `version_code=13`. It performs frontend tests,
 typechecking/lint, real cryptographic verification boundary tests, release JVM
 tests, Android release lint, GPS deadline desugaring checks, and a check that
 Gradle rejects release signing without credentials. Only then does it stage the
 upload key, compare its certificate and build `bundleRelease`.
+
+The workflow requires reviewed commit `fbec716` and unchanged reviewed frontend,
+native code and plugin dependencies. Fifteen browser regressions cover Android
+handover, parent tracking and retained iOS behaviour. The final AAB's `app.js`
+must match the reviewed SHA-256
+`44cae38a82be9d3e9bfc5f4a7bfa2bf68c4c58d0536cbff6062d049da7be620d`;
+the verification report records that hash and the reviewed commit.
 
 Gradle also verifies private-key decryptability and the pinned upload certificate.
 No signing material is added to caches or artifacts. Temporary signing/Firebase
